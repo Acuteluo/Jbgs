@@ -1,0 +1,7 @@
+demo/build/
+demo/src/ir_viewer
+*.o
+*.so
+*.a
+.cache/
+.DS_Store

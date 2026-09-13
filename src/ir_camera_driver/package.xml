@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<!-- ir_camera_driver 包: 红外热成像机芯(UVC/V4L2)驱动节点 -->
+<package format="3">
+  <name>ir_camera_driver</name>
+  <version>1.0.0</version>
+  <description>红外热成像(UVC)相机驱动: 灰度流发布 + 热插拔自愈 + 模拟模式</description>
+  <maintainer email="cly@example.com">cly</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>sensor_msgs</depend>
+  <depend>OpenCV</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

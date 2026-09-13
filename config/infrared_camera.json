@@ -1,0 +1,18 @@
+{
+  "_说明": "红外热像机芯(V4L2 设备)定义。device_path 留空时按 device_index 打开 /dev/video{index}; 真机未接入时不伪造, 留空/默认即可, 节点热插拔守望会持续探测并在日志打印实际可用设备。",
+
+  "role": "infrared",
+  "alias": "ir_camera",
+
+  "device_index": 0,
+  "device_path": "",
+
+  "frame_rate_hz": 25.0,
+  "frame_id": "ir_camera_optical_frame",
+
+  "intrinsics": {
+    "_说明": "内参占位: 原生分辨率 256x192(勿放大后做渗水检测)",
+    "resolution": [256, 192],
+    "fx": 0.0, "fy": 0.0, "cx": 0.0, "cy": 0.0, "distortion_model": ""
+  }
+}

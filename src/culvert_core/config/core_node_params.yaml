@@ -1,0 +1,52 @@
+# culvert_core 核心节点参数(供 bringup 的 launch 文件引用)
+/core_node:
+  ros__parameters:
+    # 话题固定为三条图像 + 一条传感器(话题精简约定):
+    #   /left_camera/image_raw/compressed   左大恒
+    #   /right_camera/image_raw/compressed  右大恒
+    #   /ir_camera/image_raw/compressed     红外机芯
+    #   /sensor/env                         温湿度/CO2
+    # 与驱动端 QoS 保持一致: sensor_data(低延迟、容忍丢帧)
+    use_sensor_data_qos: true
+
+    # 按 S 键保存总图+三路帧的目录(launch 把终端 S 键转发为话题请求)
+    save_dir: run_save
+
+    # ==================== 同屏显示 ====================
+    # 三窗格: 左大恒 | 右大恒 | 红外; 传感器数据叠在总图左上角
+    pane_width: 640          # 单窗格宽(像素)
+    pane_height: 480         # 单窗格高(像素)
+    pane_gap: 4              # 窗格间隔
+    display_fps: 30.0        # 显示刷新率上限(Hz)
+    stale_timeout_sec: 3.0   # 超过此时长无新帧 => 该路显示"OFFLINE"占位
+    show_img: true           # 是否弹出 culvert_monitor 窗口
+
+    # ==================== YOLO 裂缝检测(左右相机) ====================
+    # 左右各一个独立 YoloDetector 实例并行推理(Net 非线程安全, 不共享);
+    # enable_* 置 false 时该路降级为透传(仍显示画面, 不检测)。
+    yolo:
+      enable_left: true
+      enable_right: true
+      # seg = 框+分割掩膜描边(默认); detect = 仅矩形框
+      model_type: seg
+      model_path: models/crack_seg_best.onnx
+      # detect 模型: models/crack_best.onnx
+      use_gpu: false          # OpenCV CPU 已验证稳定; OpenVINO GPU 输出异常
+      conf_threshold: 0.35
+      nms_threshold: 0.45
+      input_size: 640
+      max_threads: 8          # OpenCV 线程池上限(留核给解码/显示)
+
+    # ==================== 红外渗水检测(传统方案, 无模型) ====================
+    # 来源: Culvert-Visual-Inspection-main 局部差分方案
+    # Diff = 大核高斯背景 - 原图; 正值 = 相对邻域变暗 = 渗水候选
+    ir:
+      enable: true
+      ksize: 71               # 高斯核边长(奇数); 256x192 图会自动钳位
+      diff_thresh: 15.0       # 局部灰阶差阈值(相对灰阶, 非摄氏度)
+      morph_ksize: 3          # 开运算核(去单点噪声)
+      morph_close_ksize: 21   # 闭运算核(碎斑连片)
+      min_area_px: 60.0       # 小于该面积的连通域视为噪声(256x192 原生尺度)
+      min_area_ratio: 0.3     # 相对最大区域面积比, 更小的碎轮廓丢弃
+      enable_clahe: false     # 低对比涵洞可打开
+      clahe_clip: 2.0

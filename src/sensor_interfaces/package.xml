@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sensor_interfaces</name>
+  <version>0.1.0</version>
+  <description>涵洞检测项目传感器接口定义: 塔石 TAS-WSCO2 温湿度二氧化碳传感器的环境数据消息与按需查询服务。</description>
+  <maintainer email="cly@todo.todo">cly</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 消息里用到 std_msgs/Header -->
+  <depend>std_msgs</depend>
+
+  <!-- 自定义接口包的固定三板斧(仿旧项目 serial_driver_interfaces) -->
+  <build_depend>rosidl_default_generators</build_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>culvert_inspection</name>
+  <version>0.1.0</version>
+  <description>涵洞巡检通信协议节点: 订阅 uint8 巡检指令(0x01), 对左右相机
+    分别独立选取触发后到达的第 2 帧并存盘, 双双成功后发布确认(0x02)。</description>
+  <maintainer email="cly@todo.todo">cly</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>OpenCV</depend>
+
+  <!-- 单元测试(test_inspection_fsm) -->
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

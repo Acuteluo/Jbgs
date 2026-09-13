@@ -1,0 +1,79 @@
+# 大恒双相机参数(左/右两台 MER-500-14GC, GigE)
+/galaxy_camera_dual:
+  ros__parameters:
+    # ==================== 热插拔模拟(无实体相机时置 true) ====================
+    # true  = 用 SimulatedGalaxyDevice 顶替 SDK: 插拔语义与真机一致
+    #         (走节点同一套"超时判定掉线 -> 重连"代码路径), 全链路可测;
+    # false = 真机模式(GxIAPI)。实机部署时务必改回 false(或 launch 里 sim:=false)。
+    sim_mode: true
+    sim:
+      initial_absent_sec: 8.0     # 启动后模拟"未接入"时长, 期间相机话题无数据
+      disconnect_at_sec: 30.0     # 首次"中途拔掉"时刻(秒); <=0 = 不模拟中途断连
+      disconnect_duration_sec: 8.0  # 每次中途离线持续时间(秒)
+      disconnect_repeat_period_sec: 0.0  # >0 = 每隔该秒数重复断连(极端测试)
+      image_dir: "pictures/light"  # 实拍裂缝帧, 供 YOLO 真实检出  # 轮播实拍帧(含裂缝, 供 YOLO 检出)
+      width: 1280                 # 模拟帧分辨率
+      height: 960
+
+    use_sensor_data_qos: false
+    use_camera_timestamp: true
+    timestamp_drift_compensation: true   # 补偿相机晶振与主机时钟漂移(推荐开)
+    timestamp_exposure_center: false     # 时间戳平移至曝光中心(运动补偿可开)
+    grab_timeout_ms: 300
+
+    # 话题精简: 每台相机只发布 <camera_name>/image_raw/compressed 一条话题
+    publish_camera_info: false           # camera_info 标定话题默认不再发布
+
+    # 相机组名列表, 每项对应下方 cameras.<name> 的一组参数
+    camera_names: [left, right]
+
+    cameras:
+      left:
+        # 寻址方式优先级: serial_number > user_id > ip_address > device_index
+        # 强烈建议填写 serial_number(先空跑一次, 看启动日志里打印的 SN/IP)
+        serial_number: "GW0160070152"
+        user_id: ""
+        ip_address: ""
+        device_index: 1        # GxIAPI 设备序号, 从 1 开始; 0 表示不用
+
+        # 可选: 打开后把该字符串烧写为相机持久 UserID, 之后即可用 user_id 寻址
+        user_id_to_set: ""
+
+        camera_name: left_camera
+        frame_id: left_camera_optical_frame
+        # 模拟模式: 左相机接入的画面目录(与右相机不同场景)
+        sim_image_dir: "pictures/light"
+        camera_info_url: "package://galaxy_camera_dual/config/camera_info_left.yaml"
+
+        exposure_time: 5000.0    # 曝光时间, 单位 us, 可运行时在线修改
+        gain: 1.0              # 增益, 可运行时在线修改
+        frame_rate: 20.0       # 双机目标采集帧率(Hz), 0 = 保持相机默认
+        packet_size: 8192      # 主机 MTU=9000 时使用 8192，避免 9000B 包越过 MTU
+        throughput_limit_bps: 55000000  # 每台 55MB/s；双机约 880Mbps，抑制突发拥塞
+        packet_delay: 0        # 默认关闭；固定 tick 值会因固件不同导致漏触发/帧率减半
+        # 每台相机唯一的话题: <camera_name>/image_raw/compressed(JPEG)
+        publish_compressed: true
+        jpeg_quality: 90
+        # 无损 raw 话题(默认关: 15MB/帧开销大; 要无损再开)
+        publish_raw: false
+
+      right:
+        serial_number: "GW0210040294"
+        user_id: ""
+        ip_address: ""
+        device_index: 2
+        user_id_to_set: ""
+        camera_name: right_camera
+        frame_id: right_camera_optical_frame
+        # 模拟模式: 右相机接入的另一批画面(valid 集, 与左不同)
+        sim_image_dir: "pictures/dark"
+        camera_info_url: "package://galaxy_camera_dual/config/camera_info_right.yaml"
+        exposure_time: 5000.0
+        gain: 1.0
+        frame_rate: 20.0
+        packet_size: 8192
+        throughput_limit_bps: 55000000
+        packet_delay: 0
+        publish_compressed: true
+        jpeg_quality: 90
+        publish_raw: false

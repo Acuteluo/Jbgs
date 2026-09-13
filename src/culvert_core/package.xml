@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>culvert_core</name>
+  <version>0.1.0</version>
+  <description>涵洞裂缝检测项目的核心处理节点框架: 订阅左右相机图像, 后续在此实现裂缝检测、时间戳匹配、多传感器融合。</description>
+  <maintainer email="cly@todo.todo">cly</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 运行/构建依赖: 后续加 Eigen/message_filters/tf2 时在这里追加 -->
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>OpenCV</depend>
+  <depend>sensor_interfaces</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

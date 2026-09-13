@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bringup</name>
+  <version>0.1.0</version>
+  <description>涵洞裂缝检测项目的启动包: 用 launch 文件一键拉起 相机节点 + 核心节点。</description>
+  <maintainer email="cly@todo.todo">cly</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 纯 launch 包: 运行时才解析包名, 因此用 exec_depend 声明被启动的包 -->
+  <exec_depend>galaxy_camera_dual</exec_depend>
+  <exec_depend>ir_camera_driver</exec_depend>
+  <exec_depend>tas_sensor_driver</exec_depend>
+  <exec_depend>culvert_core</exec_depend>
+  <!-- key_forward.py 在 launch 进程内用 rclpy 发布保存请求话题 -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

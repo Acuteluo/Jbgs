@@ -1,0 +1,47 @@
+# ============================================================
+# 文件: .gitignore
+# 作用: 版本管理忽略清单 —— 只跟踪源码/配置/文档/测试/模型/原始图片,
+#       忽略一切构建产物、运行时输出与临时备份。
+# ============================================================
+
+# ---- colcon 构建产物(run.sh 干净重建时也会删除) ----
+/build/
+/install/
+/log/
+
+# ---- 系统测试(tests/)的 cmake 构建目录 ----
+/tests/build/
+
+# ---- 运行时输出: 巡检/调试保存的图片(目录本身用 .gitkeep 保留) ----
+/run_save/*
+!/run_save/.gitkeep
+
+# ---- 配置向导(camera_setup_wizard)修改配置前的备份 ----
+*.bak
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+
+# ---- 编辑器/IDE ----
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- 操作系统杂项 ----
+.DS_Store
+Thumbs.db
+
+# ---- 历史调试日志(防止再被误提交) ----
+*.log
+!docs/**/*.log
+.hotplug*.log
+.s*.log
+
+# 说明:
+# - models/ 与 pictures/ 是实拍模型与原始图片资源, 必须纳入版本管理;
+# - Culvert-Visual-Inspection-main/ 为红外参考工程(含 COLCON_IGNORE),
+#   随仓库携带, 不忽略;
+# - config/ 与 src/*/config/ 下的 *.json/*.yaml 是有效配置, 不忽略;
+#   向导写配置产生的 *.bak 由上面的通配规则忽略。

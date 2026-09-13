@@ -1,0 +1,47 @@
+# 大恒单相机参数(只开 left 组一台; 话题与其余系统统一为 left_camera)
+/**:
+  ros__parameters:
+    # ==================== 热插拔模拟(无实体相机时置 true) ====================
+    sim_mode: true
+    sim:
+      initial_absent_sec: 8.0
+      disconnect_at_sec: 30.0
+      disconnect_duration_sec: 8.0
+      disconnect_repeat_period_sec: 0.0
+      image_dir: "pictures/light"  # 实拍裂缝帧, 供 YOLO 真实检出
+      width: 1280
+      height: 960
+
+    use_sensor_data_qos: false
+    use_camera_timestamp: true
+    timestamp_drift_compensation: true
+    timestamp_exposure_center: false
+    grab_timeout_ms: 300
+
+    # 话题精简: 每台相机只发布 <camera_name>/image_raw/compressed 一条话题
+    publish_camera_info: false
+
+    # 单相机模式: 只启动 left 组
+    camera_names: [left]
+
+    cameras:
+      left:
+        serial_number: "GW0160070152"
+        user_id: ""
+        ip_address: ""
+        device_index: 1
+        user_id_to_set: ""
+        # 话题统一: 单相机也发布 /left_camera/image_raw/compressed,
+        # core_node 与显示端无需区分单/双相机模式
+        camera_name: left_camera
+        frame_id: camera_optical_frame
+        camera_info_url: "package://galaxy_camera_dual/config/camera_info.yaml"
+        exposure_time: 17500.0
+        gain: 1.0
+        frame_rate: 5.0
+        throughput_limit_bps: 0  # 单机不需要设备端限带宽
+        packet_delay: 0
+        publish_compressed: true
+        jpeg_quality: 90
+        # 无损 raw 话题 <camera_name>/image_raw(默认关: 15MB/帧开销大)
+        publish_raw: false

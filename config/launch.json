@@ -1,0 +1,34 @@
+{
+  "_说明": "总启动配置: run.sh 启动 bringup/all.launch.py 时读取。键含义见 README。相对路径以工程根目录(run.sh 所在目录)为基准。launch 参数(sim:= 等)优先级高于本文件。",
+
+  "show_windows": true,
+  "fullscreen": true,
+  "in_trulyworking": true,
+  "sim_mode": true,
+  "log_level": "info",
+  "save_dir": "run_save",
+
+  "input_topic": "/inspection/command",
+  "ack_topic": "/inspection/ack",
+  "frame_timeout_sec": 3.0,
+  "target_frame_index": 2,
+
+  "enable_yolo": true,
+  "enable_ir_seepage": true,
+  "enable_sensor": true,
+
+  "camera_config_files": {
+    "left": "config/galaxy_camera1_.json",
+    "right": "config/galaxy_camera_2.json",
+    "infrared": "config/infrared_camera.json"
+  },
+
+  "sim": {
+    "_说明": "热插拔模拟时间窗(仅 sim_mode=true 生效); 测试可用 launch 参数逐设备覆盖",
+    "galaxy": { "initial_absent_sec": 2.0, "disconnect_at_sec": 0.0, "disconnect_duration_sec": 4.0 },
+    "infrared": { "initial_absent_sec": 2.0, "disconnect_at_sec": 0.0, "disconnect_duration_sec": 4.0 },
+    "sensor": { "initial_absent_sec": 2.0, "disconnect_at_sec": 0.0, "disconnect_duration_sec": 4.0 },
+    "sim_image_dir_left": "pictures/light",
+    "sim_image_dir_right": "pictures/dark"
+  }
+}

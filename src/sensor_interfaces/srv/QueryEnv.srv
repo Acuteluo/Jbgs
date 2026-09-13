@@ -1,0 +1,11 @@
+# 按需查询一次环境数据
+# 请求为空: 调用后驱动节点会立即插队做一轮完整查询, 最多等待约一个轮询周期
+---
+bool success              # 是否查询到有效数据(至少一组数据有效)
+std_msgs/Header header    # 数据对应的时刻
+
+float32 temperature       # 温度(℃)
+float32 humidity          # 湿度(%RH)
+float32 co2               # 二氧化碳浓度(ppm)
+
+string message            # 提示信息(成功或失败原因)

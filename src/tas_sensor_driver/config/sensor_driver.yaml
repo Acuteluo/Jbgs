@@ -1,0 +1,34 @@
+# 塔石 TAS-WSCO2 传感器驱动参数(出厂默认 9600 8N1, 地址 1)
+tas_sensor_driver:
+  ros__parameters:
+    # ---- 热插拔模拟(无实体传感器时置 true) ----
+    # true  = 跳过串口, 温湿度/CO2 由模拟生成; 离线时间窗内发布"无效"数据,
+    #         与真机拔线行为同构(走同一套 valid 标志/发布路径);
+    # false = 真机模式(POSIX termios 串口)。
+    sim_mode: true
+    sim:
+      initial_absent_sec: 5.0        # 启动后模拟"未接入"时长(秒)
+      disconnect_at_sec: 40.0        # 首次"中途拔掉"时刻(秒); <=0 = 不模拟
+      disconnect_duration_sec: 10.0  # 每次中途离线时长(秒)
+      disconnect_repeat_period_sec: 0.0  # >0 = 周期重复断连(极端测试)
+      base_temperature: 25.0         # 模拟温度基准(℃)
+      base_humidity: 60.0            # 模拟湿度基准(%RH)
+      base_co2: 650.0                # 模拟 CO2 基准(ppm)
+
+    # ---- 串口(真机模式; 插上转接器后 ls /dev/ttyUSB* 确认) ----
+    device_name: "/dev/ttyUSB0"
+    baud_rate: 9600
+    flow_control: "none"      # none / hardware / software
+    parity: "none"            # none / odd / even
+    stop_bits: "1"            # 1 / 1.5 / 2
+
+    # ---- Modbus ----
+    modbus_addr: 1            # 从机地址(出厂 1, 改过的话这里同步改)
+
+    # ---- 轮询(传感器数值 2s 更新一次, 1Hz 足够; 间隔/超时必须 ≥200ms) ----
+    poll_interval_ms: 1000
+    query_timeout_ms: 500
+    inter_query_gap_ms: 200
+
+    # ---- 日志 ----
+    show_logger: true         # 每轮打印 温度/湿度/CO2 读数

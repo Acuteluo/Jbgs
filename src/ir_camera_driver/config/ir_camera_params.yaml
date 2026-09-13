@@ -1,0 +1,27 @@
+# 红外热成像机芯(256x192, UVC/V4L2)驱动参数
+ir_camera_driver:
+  ros__parameters:
+    # 唯一话题基名: 实际发布 <topic_base>/compressed
+    topic_base: "/ir_camera/image_raw"
+    frame_id: "ir_camera_optical_frame"
+
+    # ---- 真机(UVC)参数 ----
+    device_index: 0          # /dev/videoN 的 N(机芯通常枚举为后插入的序号)
+    device_path: ""          # 直接给路径(如 /dev/video2)时优先于序号
+    frame_rate: 25.0         # 发布帧率上限(Hz), 0 = 跟随机芯
+    grab_fail_limit: 10      # 连续失败次数上限, 超过判定离线并进入热插拔恢复
+    jpeg_quality: 80
+    use_sensor_data_qos: true
+
+    # ---- 热插拔模拟(无实体机芯时置 true; 插拔语义与真机一致) ----
+    # true  = 生成模拟热像(渐变底 + 移动冷斑), 冷斑供下游渗水检测真实检出;
+    # false = 真机模式(cv::VideoCapture / CAP_V4L2)。
+    sim_mode: true
+    sim:
+      initial_absent_sec: 8.0        # 启动后模拟"未接入"时长(秒)
+      disconnect_at_sec: 35.0        # 首次"中途拔掉"时刻(秒); <=0 = 不模拟
+      disconnect_duration_sec: 8.0   # 每次中途离线时长(秒)
+      disconnect_repeat_period_sec: 0.0  # >0 = 周期重复断连(极端测试)
+      fps: 25.0                      # 模拟出图帧率
+      width: 256                     # 机芯典型分辨率 256x192
+      height: 192
