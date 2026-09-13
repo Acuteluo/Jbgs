@@ -10,7 +10,7 @@
 ## 硬性规则
 
 1. **相对路径**一律经 `JBGS_ROOT` 环境变量解析（run.sh/env.sh 导出；C++ 侧 `ResolvePath()` 已有实现：core_node / inspection_node / galaxy_camera_node）。
-2. **巡检协议**（`culvert_inspection`）状态机逻辑只改 `inspection_fsm.hpp`，改完必须跑：
+2. **巡检协议**（`culvert_inspection`，导航↔视觉：下行 `/vision_capture_cmd`、上行 `/vision_capture_status`，UInt8 电平 20Hz；完成后门控等 0x00）状态机逻辑只改 `inspection_fsm.hpp`，改完必须跑：
    - `colcon test --packages-select culvert_inspection`（gtest 单测，12 个用例）
    - `bash tests/run_tests.sh 05`（端到端）
    - 不变量：双帧齐才写盘；写盘全成才发一次 0x02；单侧失败清理半对文件；处理中 0x01 被忽略。

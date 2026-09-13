@@ -25,7 +25,7 @@ DG-202603 涵洞巡检赛题感知系统：双大恒相机（左/右）+ 红外�
 | `sim_mode` | 热插拔模拟总开关（无真机时置 true） | `true` |
 | `log_level` | ROS 日志级别 debug/info/warn/error | `info` |
 | `save_dir` | 巡检图片保存目录（相对工程根） | `run_save` |
-| `input_topic` / `ack_topic` | 巡检指令输入 / 确认输出话题（UInt8） | `/inspection/command` / `/inspection/ack` |
+| `input_topic` / `ack_topic` | 导航→视觉指令 / 视觉→导航状态话题（UInt8 电平, 20Hz） | `/vision_capture_cmd` / `/vision_capture_status` |
 | `frame_timeout_sec` | 巡检目标帧等待超时 | `3.0` |
 | `target_frame_index` | 取 t 后第 N 帧 | `2` |
 | `enable_yolo` / `enable_ir_seepage` / `enable_sensor` | 模型与传感器开关 | `true` |
@@ -77,9 +77,10 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 | `/sensor/env` | sensor_interfaces/EnvData | 温湿度/CO2（1Hz） |
 | `/core_node/status` | String | 1Hz 心跳：各路帧率 + on/OFF 离线标识 + 传感器摘要 |
 | `/core_node/save_image` | Empty | 调试：按 S 键保存总图 |
-| `/inspection/command` | UInt8 | 巡检指令（0x01） |
-| `/inspection/ack` | UInt8 | 巡检确认（0x02） |
-| `/inspection_node/status` | String | 巡检状态机状态（10Hz） |
+| `/vision_capture_cmd` | UInt8 | 导航→视觉指令（0x00 空闲 / 0x01 触发, 20Hz 电平） |
+| `/vision_capture_status` | UInt8 | 视觉→导航状态（0x00 空闲 / 0x01 保存中 / 0x02 拍完） |
+| `/inspection_node/status` | String | 巡检状态机调试状态（ARMED/SAVING/IDLE…） |
+| `/core_node/left_annotated` `/right_annotated` | CompressedImage | 模型处理完的全分辨率标注帧（巡检保存用，仅订阅时编码） |
 
 ## 解耦与热插拔设计
 
