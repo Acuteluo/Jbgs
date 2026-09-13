@@ -18,7 +18,7 @@
   "enable_sensor": true,
 
   "camera_config_files": {
-    "left": "config/galaxy_camera1_.json",
+    "left": "config/galaxy_camera_1.json",
     "right": "config/galaxy_camera_2.json",
     "infrared": "config/infrared_camera.json"
   },

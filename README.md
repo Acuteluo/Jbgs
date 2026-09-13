@@ -32,7 +32,7 @@ DG-202603 涵洞巡检赛题感知系统：双大恒相机（左/右）+ 红外�
 | `camera_config_files` | 左/右/红外相机设备 JSON 路径 | 见下 |
 | `sim.*` | 模拟热插拔时间窗（初始缺失/中途断连时刻与时长，每设备独立） | 见文件 |
 
-相机设备定义：`config/galaxy_camera1_.json`（左）、`config/galaxy_camera_2.json`（右）、`config/infrared_camera.json`（红外）。含设备 ID（serial_number/user_id/ip/device_index，可留空）、别名、内参/分辨率占位。**真机未接入时不要伪造设备 ID**：留空或用默认，启动后从日志中抄录实际 SN/IP 回填。
+相机设备定义：`config/galaxy_camera_1.json`（左）、`config/galaxy_camera_2.json`（右）、`config/infrared_camera.json`（红外）。含设备 ID（serial_number/user_id/ip/device_index，可留空）、别名、内参/分辨率占位。**真机未接入时不要伪造设备 ID**：留空或用默认，启动后从日志中抄录实际 SN/IP 回填。
 
 launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 = 尊重 launch.json/yaml）：
 
