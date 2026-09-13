@@ -671,7 +671,8 @@ void CoreNode::VisibleDetectLoop(
             {
                 auto & ann_pub = (&stream == &left_) ? left_annotated_pub_
                                                      : right_annotated_pub_;
-                if (ann_pub)
+                // 仅在有订阅者时才做 JPEG 编码(无订阅零开销)
+                if (ann_pub && ann_pub->get_subscription_count() > 0)
                 {
                     std::vector<uint8_t> buf;
                     std::vector<int> qp = {cv::IMWRITE_JPEG_QUALITY,

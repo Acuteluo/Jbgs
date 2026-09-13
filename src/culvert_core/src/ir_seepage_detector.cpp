@@ -188,7 +188,7 @@ IrSeepageResult IrSeepageDetector::detect(const cv::Mat & frame)
                       static_cast<double>(params_.temporal_min_hits) - 0.5,
                       255.0, cv::THRESH_BINARY);
         confirmed.convertTo(confirmed, CV_8U);
-        out.hit_count = hit_count_;
+        out.hit_count = hit_count_.clone();
     }
 
     // ---- 7. 形态学(开运算去单点噪声, 闭运算连片) ----

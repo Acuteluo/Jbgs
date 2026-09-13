@@ -80,7 +80,7 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 | `/vision_capture_cmd` | UInt8 | 导航→视觉指令（0x00 空闲 / 0x01 触发, 20Hz 电平） |
 | `/vision_capture_status` | UInt8 | 视觉→导航状态（0x00 空闲 / 0x01 保存中 / 0x02 拍完） |
 | `/inspection_node/status` | String | 巡检状态机调试状态（ARMED/SAVING/IDLE…） |
-| `/core_node/left_annotated` `/right_annotated` | CompressedImage | 模型处理完的全分辨率标注帧（巡检保存用，仅订阅时编码） |
+| `/core_node/left_annotated` `/right_annotated` | CompressedImage | 模型处理完画框后的标注帧（窗格分辨率、含信息条；有订阅者时才编码） |
 
 ## 解耦与热插拔设计
 
