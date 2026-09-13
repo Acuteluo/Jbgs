@@ -534,6 +534,81 @@ std::string primary_ipv4_cidr(const std::string & nic)
 
 /// 检查相机网段 vs 主机网卡; 不同段时提供 sudo 自动修复。
 /// 返回: true = 网段已就绪(原本就绪或修复成功)。
+/// 枚举有线候选网卡(排除 lo/无线 wl*/常见虚拟口)。
+std::vector<std::string> list_wired_nics()
+{
+    std::vector<std::string> cands;
+    if (auto * fp = popen("ip -o link show 2>/dev/null", "r"))
+    {
+        char line[512];
+        while (fgets(line, sizeof(line), fp) != nullptr)
+        {
+            std::string l(line);
+            if (l.find(" lo:") != std::string::npos)
+            {
+                continue;
+            }
+            const size_t c1 = l.find(':');
+            const size_t c2 = l.find(':', c1 + 1);
+            if (c1 == std::string::npos || c2 == std::string::npos)
+            {
+                continue;
+            }
+            std::string name = l.substr(c1 + 2, c2 - c1 - 2);
+            // 排除无线(wl*)与常见虚拟口
+            if (name.rfind("wl", 0) == 0 ||
+                name.rfind("tailscale", 0) == 0 ||
+                name.rfind("Meta", 0) == 0 ||
+                name.rfind("br-", 0) == 0 ||
+                name.rfind("veth", 0) == 0 ||
+                name.rfind("docker", 0) == 0)
+            {
+                continue;
+            }
+            cands.push_back(name);
+        }
+        pclose(fp);
+    }
+    return cands;
+}
+
+/// 选择连接相机交换机的网卡: 单候选自动采用, 多候选按编号选择。
+/// 返回空串 = 用户放弃/无候选。
+std::string select_wired_nic()
+{
+    const auto cands = list_wired_nics();
+    if (cands.empty())
+    {
+        std::cout << "  [错误] 未发现任何有线网卡! 请插好扩展坞或 USB 网卡"
+                     "(本机无板载网口)" << std::endl;
+        return "";
+    }
+    if (cands.size() == 1)
+    {
+        std::cout << "  检测到唯一有线网卡: " << cands.front()
+                  << " (自动采用)" << std::endl;
+        return cands.front();
+    }
+    std::cout << "  检测到多块有线网卡:" << std::endl;
+    for (size_t i = 0; i < cands.size(); ++i)
+    {
+        std::cout << "    [" << (i + 1) << "] " << cands[i] << std::endl;
+    }
+    std::cout << "  输入连接相机交换机的网卡编号: " << std::flush;
+    std::string a;
+    std::getline(std::cin, a);
+    const int idx = std::atoi(a.c_str());
+    if (idx >= 1 && idx <= static_cast<int>(cands.size()))
+    {
+        std::cout << "  已选择: " << cands[static_cast<size_t>(idx - 1)]
+                  << std::endl;
+        return cands[static_cast<size_t>(idx - 1)];
+    }
+    std::cout << "  [错误] 编号无效" << std::endl;
+    return "";
+}
+
+
 bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
                         bool check_only, int * failures)
 {
@@ -685,12 +760,9 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
         ++(*failures);
         return false;
     }
-    const std::string nic = ask("  输入连接相机交换机的网卡名: ");
-    if (nic.empty() || nic.find_first_not_of(
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
-            != std::string::npos)
+    const std::string nic = select_wired_nic();
+    if (nic.empty())
     {
-        std::cout << "  [错误] 网卡名不合法，未执行任何系统网络修改" << std::endl;
         ++(*failures);
         return false;
     }
@@ -1067,34 +1139,10 @@ int main(int argc, char ** argv)
         if (ask_yes("  是否给某个网卡加 link-local 地址(169.254.10.10/16) "
                     "后重新枚举?", false))
         {
-            std::cout << "  本机网卡: " << std::endl;
-            if (auto * fp = popen("ip -o link show 2>/dev/null", "r"))
+            const std::string nic = select_wired_nic();
+            if (nic.empty())
             {
-                char line[512];
-                while (fgets(line, sizeof(line), fp) != nullptr)
-                {
-                    std::string l(line);
-                    if (l.find(" lo:") != std::string::npos)
-                    {
-                        continue;
-                    }
-                    // "2: enx0: <BROADCAST...>" => 取第二个冒号前的名字
-                    const size_t c1 = l.find(':');
-                    const size_t c2 = l.find(':', c1 + 1);
-                    if (c1 != std::string::npos && c2 != std::string::npos)
-                    {
-                        std::cout << "    " << l.substr(c1 + 2, c2 - c1 - 2)
-                                  << std::endl;
-                    }
-                }
-                pclose(fp);
-            }
-            const std::string nic = ask("  输入要使用的网卡名: ");
-            if (nic.empty() || nic.find_first_not_of(
-                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
-                    != std::string::npos)
-            {
-                std::cout << "  [错误] 网卡名不合法，未执行网络修改" << std::endl;
+                std::cout << "  [错误] 未选择网卡, 无法自举" << std::endl;
                 ++failures;
                 return 1;
             }
@@ -1312,7 +1360,7 @@ int main(int argc, char ** argv)
         if (!left_sn.empty())
         {
             patch_json_string_value(
-                root + "/config/galaxy_camera1_.json", "serial_number",
+                root + "/config/galaxy_camera_1.json", "serial_number",
                 left_sn);
         }
         if (!right_sn.empty())

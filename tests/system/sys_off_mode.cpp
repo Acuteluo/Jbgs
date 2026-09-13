@@ -47,11 +47,11 @@ int main()
 
     // 订阅确认话题(不应有任何消息)
     Monitor<std_msgs::msg::UInt8> ack;
-    ack.attach(node, "/inspection/ack", true);
+    ack.attach(node, "/vision_capture_status", true);
 
     // 发布 0x01(协议已关闭, 无订阅者)
     auto cmd_pub = node->create_publisher<std_msgs::msg::UInt8>(
-        "/inspection/command", rclcpp::QoS(10));
+        "/vision_capture_cmd", rclcpp::QoS(10));
     // 稍等以确保若节点误订阅也能建立匹配
     jbgs_test::spin_for(node, 1.0);
     std_msgs::msg::UInt8 msg;

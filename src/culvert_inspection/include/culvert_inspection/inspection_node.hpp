@@ -40,8 +40,12 @@ public:
 private:
     // ---- 参数 ----
     bool in_trulyworking_ = false;       ///< 巡检模式总开关
-    std::string input_topic_;            ///< 巡检指令输入话题(UInt8)
-    std::string ack_topic_;              ///< 确认输出话题(UInt8)
+    std::string input_topic_;            ///< 导航->视觉指令话题(UInt8)
+    std::string ack_topic_;              ///< 视觉->导航状态话题(UInt8)
+    double status_rate_hz_ = 20.0;       ///< 协议状态发布频率(可调)
+    double annot_gap_ms_ = 500.0;        ///< 标注图与原图时间戳配对容差
+    std::string left_annotated_topic_;   ///< 左标注图话题(culvert_core 发布)
+    std::string right_annotated_topic_;  ///< 右标注图话题
     bool use_sensor_data_qos_ = true;    ///< 与驱动发布端 QoS 一致
 
     // ---- 回调 ----
@@ -51,14 +55,25 @@ private:
     void ImageCallback(
         InspectionFsm::Side & side,
         sensor_msgs::msg::CompressedImage::SharedPtr msg);
-    /// 看门狗(10Hz): 状态发布 + 无进展超时检查。
+    /// 看门狗(10Hz): 无进展超时检查。
     void WatchdogTimer();
+    /// 协议状态定时发布(可调频率): 0x00 空闲 / 0x01 保存中 / 0x02 完成。
+    void StatusTimer();
+    /// 标注图回调: Armed 且原图已捕获时, 按时间戳容差配对暂存。
+    void AnnotatedCallback(
+        InspectionFsm::Side & side,
+        sensor_msgs::msg::CompressedImage::SharedPtr msg);
 
     // ---- ROS2 对象 ----
     rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr cmd_sub_;
-    rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr ack_pub_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+    rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr status_pub_;       ///< 导航协议状态
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_str_pub_;  ///< 调试状态(String)
     rclcpp::TimerBase::SharedPtr watchdog_timer_;
+    rclcpp::TimerBase::SharedPtr status_timer_;
+    rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr
+        left_ann_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr
+        right_ann_sub_;
     rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr left_sub_;
     rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr right_sub_;
     rclcpp::CallbackGroup::SharedPtr left_cb_group_;   ///< 左解码独立回调组
@@ -67,7 +82,9 @@ private:
 
     // ---- 状态机与串行化 ----
     std::unique_ptr<InspectionFsm> fsm_;
-    std::mutex state_mutex_;   ///< 协议处理串行化(Armed/Saving 期间)
+    std::mutex state_mutex_;       ///< 协议处理串行化(Armed/Saving 期间)
+    bool done_await_zero_ = false; ///< 完成后等导航回 0x00(防残留 0x01 误触发)
+    std::atomic<uint8_t> last_cmd_level_{0};  ///< 导航指令电平(0x00/0x01)
 };
 
 }  // namespace culvert_inspection

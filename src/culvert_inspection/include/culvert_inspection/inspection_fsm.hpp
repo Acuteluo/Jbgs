@@ -88,6 +88,11 @@ public:
         bool captured = false;                ///< 目标帧是否已暂存
         std::vector<uint8_t> jpeg;            ///< 暂存的 JPEG(已通过解码)
         int64_t stamp_ns = 0;                 ///< 该帧时间戳(文件名)
+
+        // ---- 标注图(模型处理完框出来的图, 与原图同名配对保存) ----
+        std::vector<uint8_t> ann_jpeg;  ///< 暂存的标注图 JPEG
+        int64_t ann_stamp_ns = 0;       ///< 标注图源帧时间戳
+        bool ann_captured = false;      ///< 是否已取到时间戳配对的标注图
     };
 
     struct Params
@@ -95,6 +100,9 @@ public:
         int target_frame_index = 2;           ///< t 后第 N 帧(N=2)
         double frame_timeout_sec = 3.0;       ///< 无进展超时(秒)
         std::string save_dir;                 ///< 保存目录
+        double annot_gap_ms = 500.0;          ///< 标注图与原图时间戳配对容差
+        std::string raw_subdir = "raw";       ///< 原图保存子目录
+        std::string annotated_subdir = "annotated";  ///< 标注图保存子目录
     };
 
     /// Side 含 atomic(不可拷贝/移动), 由状态机内部按名构造;
@@ -138,6 +146,32 @@ public:
              std::to_string(params_.target_frame_index) + " 帧(超时 " +
              std::to_string(params_.frame_timeout_sec) + "s)");
         return 1;
+    }
+
+    /// 到达一路标注图(模型处理完框出来的图): 仅在该侧原图已捕获、
+    /// 且时间戳与原图配对(容差 annot_gap_ms)时暂存。两侧原图+标注图
+    /// 四者齐备才写盘。需外部串行化。
+    void onAnnotatedFrame(Side & side, const InspectionFrame & frame)
+    {
+        if (state_.load(std::memory_order_acquire) != FsmState::kArmed ||
+            !side.captured || side.ann_captured)
+        {
+            return;
+        }
+        const double gap_ms = std::abs(
+            static_cast<double>(frame.stamp_ns - side.stamp_ns)) / 1e6;
+        if (frame.stamp_ns <= 0 || gap_ms > params_.annot_gap_ms)
+        {
+            return;   // 时间戳对不上(模型滞后过多): 继续等后续标注图
+        }
+        side.ann_jpeg.assign(frame.data, frame.data + frame.size);
+        side.ann_stamp_ns = frame.stamp_ns;
+        side.ann_captured = true;
+        touchProgress();   // 标注图到达也算进展
+        log_("INFO", side.name + " 标注图已配对(时间戳 " +
+             std::to_string(frame.stamp_ns) + ", 偏差 " +
+             std::to_string(gap_ms) + "ms)");
+        finishIfReady();
     }
 
     /// 到达一帧并按状态机处理。
@@ -226,49 +260,63 @@ private:
     /// 刷新"最近进展"时刻(超时从此起算)。
     void touchProgress() { last_progress_ = clock_(); }
 
-    /// 双帧齐 -> 写盘 -> 成功发一次 0x02(需外部串行化)。
+    /// 左右原图 + 左右标注图四者齐 -> 写盘 -> 成功发一次 0x02。
+    /// (需外部串行化; onFrame 与 onAnnotatedFrame 都会调用本函数)
     void finishIfReady()
     {
-        if (!left_.captured || !right_.captured)
+        if (!left_.captured || !right_.captured ||
+            !left_.ann_captured || !right_.ann_captured)
         {
             return;
         }
         state_.store(FsmState::kSaving, std::memory_order_release);
 
         // 文件名 = 所选帧自身时间戳(纳秒); 异常(<=0)时退化用触发时刻,
-        // 避免跨周期互相覆盖。左右各自独立命名。
+        // 避免跨周期互相覆盖。原图与标注图分别存 raw/ 与 annotated/。
         const auto prefix = [this](const Side & s) {
             return s.stamp_ns > 0 ? std::to_string(s.stamp_ns)
                                   : std::to_string(trigger_ns_);
         };
+        const std::string raw_dir =
+            params_.save_dir + "/" + params_.raw_subdir;
+        const std::string ann_dir =
+            params_.save_dir + "/" + params_.annotated_subdir;
         const std::string left_path =
-            params_.save_dir + "/" + prefix(left_) + "_left.jpg";
+            raw_dir + "/" + prefix(left_) + "_left.jpg";
         const std::string right_path =
-            params_.save_dir + "/" + prefix(right_) + "_right.jpg";
+            raw_dir + "/" + prefix(right_) + "_right.jpg";
+        const std::string left_ann_path =
+            ann_dir + "/" + prefix(left_) + "_left.jpg";
+        const std::string right_ann_path =
+            ann_dir + "/" + prefix(right_) + "_right.jpg";
 
         const bool ok_left =
             writer_(left_path, left_.jpeg.data(), left_.jpeg.size());
         const bool ok_right =
             writer_(right_path, right_.jpeg.data(), right_.jpeg.size());
+        const bool ok_left_ann =
+            writer_(left_ann_path, left_.ann_jpeg.data(),
+                    left_.ann_jpeg.size());
+        const bool ok_right_ann =
+            writer_(right_ann_path, right_.ann_jpeg.data(),
+                    right_.ann_jpeg.size());
+        const bool ok = ok_left && ok_right && ok_left_ann && ok_right_ann;
 
-        if (ok_left && ok_right)
+        if (ok)
         {
             ack_();   // 仅此一处发布 0x02
             log_("INFO", "[cycle " + std::to_string(cycle_id_) +
-                 "] 巡检完成: " + left_path + " / " + right_path +
+                 "] 巡检完成: 原图 " + left_path + " / " + right_path +
+                 " + 标注图 " + left_ann_path + " / " + right_ann_path +
                  " 已写入, 发布确认 0x02");
             state_.store(FsmState::kIdle, std::memory_order_release);
             return;
         }
-        // 单侧失败: 删除"成功写出"的那半(它已落盘), 避免残留不完整数据。
-        if (ok_left && !ok_right)
-        {
-            remover_(left_path);
-        }
-        if (!ok_left && ok_right)
-        {
-            remover_(right_path);
-        }
+        // 任一失败: 清理所有已写出的文件, 避免残留不完整数据。
+        if (ok_left) { remover_(left_path); }
+        if (ok_right) { remover_(right_path); }
+        if (ok_left_ann) { remover_(left_ann_path); }
+        if (ok_right_ann) { remover_(right_ann_path); }
         log_("ERROR", "[cycle " + std::to_string(cycle_id_) + "] 写盘失败(" +
              std::string(ok_left ? "left ok" : "left FAIL") + "/" +
              std::string(ok_right ? "right ok" : "right FAIL") +

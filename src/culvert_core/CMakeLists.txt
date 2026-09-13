@@ -81,6 +81,18 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 if(BUILD_TESTING)
     find_package(ament_lint_auto REQUIRED)
     ament_lint_auto_find_test_dependencies()
+
+    # ---- 红外渗水检测器单元测试(时间一致性滑窗, gtest) ----
+    find_package(ament_cmake_gtest REQUIRED)
+    ament_add_gtest(test_ir_seepage_detector
+        test/test_ir_seepage_detector.cpp
+        src/ir_seepage_detector.cpp
+    )
+    target_include_directories(test_ir_seepage_detector PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_ir_seepage_detector ${OpenCV_LIBRARIES})
 endif()
 
 ament_package()

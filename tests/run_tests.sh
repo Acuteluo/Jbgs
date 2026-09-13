@@ -46,6 +46,13 @@ set +u
 source "$PROJECT_ROOT/install/setup.bash"
 set -u
 
+# ---- 1.5 清扫历史残留进程(孤儿节点会让所有"无残留"断言失败) ----
+for pat in "galaxy_camera_dual_nod[e]" "core_nod[e]" "inspection_nod[e]" \
+           "ir_camera_driver_nod[e]" "tas_sensor_driver_nod[e]" "ros2 launch bringu[p]"; do
+    pkill -KILL -f "$pat" 2>/dev/null
+done
+sleep 1
+
 # ---- 2. 构建系统测试可执行文件 ----
 BUILD_DIR="$TESTS_DIR/build"
 cmake -S "$TESTS_DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=None > /tmp/jbgs_tests_cmake.log 2>&1 \

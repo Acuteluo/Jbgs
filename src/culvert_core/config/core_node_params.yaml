@@ -48,5 +48,10 @@
       morph_close_ksize: 21   # 闭运算核(碎斑连片)
       min_area_px: 60.0       # 小于该面积的连通域视为噪声(256x192 原生尺度)
       min_area_ratio: 0.3     # 相对最大区域面积比, 更小的碎轮廓丢弃
+      # 时间一致性(抗单帧误报): 最近 window 帧滑窗内 Diff 超阈命中
+      # >= min_hits 帧才确认渗水; window<=1 = 关闭(纯单帧检测)。
+      # 代价: 启动/复位后前 min_hits-1 帧为预热期, 不输出区域。
+      temporal_window: 5      # 滑窗长度(帧)
+      temporal_min_hits: 3    # 窗口内至少命中帧数(自动钳位 <= window)
       enable_clahe: false     # 低对比涵洞可打开
       clahe_clip: 2.0

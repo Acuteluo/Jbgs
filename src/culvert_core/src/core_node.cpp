@@ -60,6 +60,10 @@ constexpr auto kDetectPollInterval = std::chrono::milliseconds(10);
 /// 显示循环的节拍间隔由 display_fps_ 计算, 这里是下限保护。
 constexpr auto kDisplayMinInterval = std::chrono::milliseconds(5);
 
+/// 红外时间一致性滑窗的断流复位间隔(秒): 两次处理帧间隔超过该值
+/// (热插拔离线/长时间断流)视为场景不连续, 复位滑窗历史防止"假确认"。
+constexpr double kIrTemporalResetGapSec = 1.0;
+
 /// imshow 窗口标题(单窗口同屏)。
 constexpr const char * kWindowName = "culvert_monitor";
 
@@ -202,9 +206,10 @@ CoreNode::CoreNode()
         RCLCPP_INFO(
             get_logger(),
             "红外渗水检测已启用: ksize=%d diff_thresh=%.1f "
-            "morph=%d/%d min_area=%.0f",
+            "morph=%d/%d min_area=%.0f temporal=%d帧/%d命中",
             ir_params_.ksize, ir_params_.diff_thresh, ir_params_.morph_ksize,
-            ir_params_.morph_close_ksize, ir_params_.min_area_px);
+            ir_params_.morph_close_ksize, ir_params_.min_area_px,
+            ir_params_.temporal_window, ir_params_.temporal_min_hits);
     }
 
     // 7. 启动各工作线程(异常护栏在各线程循环内部, 见各 Loop 实现)
@@ -307,6 +312,15 @@ void CoreNode::InitParams()
     // 旧默认 120 会把它当噪声滤掉; 256 尺度下 30~60 合理, 见方案文档)
     ir_params_.min_area_px = declare_parameter("ir.min_area_px", 60.0);
     ir_params_.min_area_ratio = declare_parameter("ir.min_area_ratio", 0.3);
+    // 时间一致性: 最近 window 帧滑窗内命中 >= min_hits 才确认渗水,
+    // 抗单帧误报(JPEG 块效应/AGC 抖动/飞过冷物体); window<=1 = 关闭
+    ir_params_.temporal_window = declare_parameter("ir.temporal_window", 5);
+    ir_params_.temporal_min_hits =
+        declare_parameter("ir.temporal_min_hits", 3);
+    // 标注图发布: 巡检保存用的是"模型处理完画框后的帧"
+    publish_annotated_ = declare_parameter("publish_annotated", true);
+    annotated_quality_ =
+        declare_parameter("annotated_jpeg_quality", 85);
     ir_params_.enable_clahe = declare_parameter("ir.enable_clahe", false);
     ir_params_.clahe_clip = declare_parameter("ir.clahe_clip", 2.0);
 }
@@ -320,6 +334,20 @@ void CoreNode::InitROS2()
 
     // 三路图像订阅各自独立回调组 => 三路 JPEG 解码并发执行,
     // 一路卡顿(大图解码/坏帧)不会排队阻塞其他路(多线程要点)。
+    // 标注图发布器(模型处理完画框后的帧; 巡检协议保存用)
+    if (publish_annotated_)
+    {
+        const auto ann_qos = rclcpp::QoS(
+            rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
+            rmw_qos_profile_sensor_data);
+        left_annotated_pub_ =
+            create_publisher<sensor_msgs::msg::CompressedImage>(
+                "/core_node/left_annotated", ann_qos);
+        right_annotated_pub_ =
+            create_publisher<sensor_msgs::msg::CompressedImage>(
+                "/core_node/right_annotated", ann_qos);
+    }
+
     left_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     right_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     ir_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -637,6 +665,30 @@ void CoreNode::VisibleDetectLoop(
                            fps, n_cracks, infer_ms);
             DrawPaneHeader(pane_img, stream.title, info);
 
+            // 5.5) 发布标注图(模型处理完画框后的帧), 供巡检协议保存;
+            //      JPEG 编码在本检测线程内完成, 与显示/采集互不阻塞。
+            if (publish_annotated_ && !pane_img.empty())
+            {
+                auto & ann_pub = (&stream == &left_) ? left_annotated_pub_
+                                                     : right_annotated_pub_;
+                // 仅在有订阅者时才做 JPEG 编码(无订阅零开销)
+                if (ann_pub && ann_pub->get_subscription_count() > 0)
+                {
+                    std::vector<uint8_t> buf;
+                    std::vector<int> qp = {cv::IMWRITE_JPEG_QUALITY,
+                                           annotated_quality_};
+                    if (cv::imencode(".jpg", pane_img, buf, qp))
+                    {
+                        sensor_msgs::msg::CompressedImage msg;
+                        msg.header.stamp = stream.latest_stamp;
+                        msg.header.frame_id = stream.name;
+                        msg.format = "jpeg";
+                        msg.data = std::move(buf);
+                        ann_pub->publish(msg);
+                    }
+                }
+            }
+
             // 6) 交给显示线程(锁内 swap, 只保留最新)
             SubmitPane(pane, pane_img, last_seq);
 
@@ -683,6 +735,9 @@ void CoreNode::IrDetectLoop()
     uint64_t last_seq = 0;
     double fps = 0.0;
     auto prev_time = std::chrono::steady_clock::now();
+    // 上次处理的帧到达时刻(检测线程视角): 用于断流复位时间一致性滑窗。
+    // epoch 为 0 表示尚未处理过任何帧。
+    auto last_frame_time = std::chrono::steady_clock::time_point{};
 
     while (rclcpp::ok() && detect_run_)
     {
@@ -704,6 +759,24 @@ void CoreNode::IrDetectLoop()
 
         try
         {
+            // 0) 断流复位: 距上帧超过 kIrTemporalResetGapSec(热插拔离线/
+            //    长时间断流)视为场景不连续, 清空时间一致性滑窗 —— 滑窗里
+            //    的旧帧与当前画面已无关, 继续沿用会造成"假确认"。
+            const auto now_frame = std::chrono::steady_clock::now();
+            if (last_frame_time.time_since_epoch().count() != 0 && ir_detector_)
+            {
+                const double gap = std::chrono::duration<double>(
+                    now_frame - last_frame_time).count();
+                if (gap > kIrTemporalResetGapSec)
+                {
+                    ir_detector_->reset();
+                    RCLCPP_INFO(
+                        get_logger(),
+                        "[ir] 相隔 %.1fs 无新帧, 已复位时间一致性滑窗", gap);
+                }
+            }
+            last_frame_time = now_frame;
+
             // 1) 在机芯"原生分辨率"上检测(如 256x192), 不要先放大再检测:
             //    上采样会摊平冷斑与背景场的灰度差(实测 Diff 峰值 36 -> 20,
             //    贴着阈值导致漏检), 且 ksize 参数与原生分辨率绑定才可移植。
@@ -711,7 +784,7 @@ void CoreNode::IrDetectLoop()
             IrSeepageResult result;
             if (ir_detector_)
             {
-                // detect 只读参数/只写局部输出, 线程内串行调用无需加锁
+                // detect 带滑窗内部状态, 本线程内串行调用无需加锁
                 result = ir_detector_->detect(frame);
             }
             const double infer_ms =

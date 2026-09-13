@@ -85,6 +85,7 @@ private:
         std::atomic<uint64_t> count{0};       ///< 累计收帧数
         std::atomic<uint64_t> count_prev{0};  ///< 上一秒累计(算 hz 用)
 
+
         /// 原图取帧率(帧间到达间隔的 EMA 平滑, 回调线程更新)。
         /// 供窗格信息条"实时显示当前取原相机原图的帧率"; 与检测输出
         /// 帧率(det, 检测线程 EMA)相互独立 —— 模型消费慢时 src 不变。
@@ -200,6 +201,14 @@ private:
     double display_fps_ = 30.0;        ///< 显示刷新率上限(Hz)
     double stale_timeout_sec_ = 3.0;   ///< 超过该时长无新帧判定该路离线
     bool show_img_ = true;             ///< 是否弹出同屏显示窗口
+
+    // ---- 标注图发布(巡检保存"模型处理完框出来的图"用) ----
+    bool publish_annotated_ = true;   ///< 是否发布标注图话题
+    int annotated_quality_ = 85;      ///< 标注图 JPEG 质量
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr
+        left_annotated_pub_;   ///< /core_node/left_annotated
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr
+        right_annotated_pub_;  ///< /core_node/right_annotated
     bool fullscreen_ = true;           ///< 全屏展示(无边框占满整屏, 窗格随屏幕比例)
     int screen_w_ = 1920;              ///< 屏幕宽(0=启动时 xrandr 自动探测)
     int screen_h_ = 1080;              ///< 屏幕高(0=启动时 xrandr 自动探测)

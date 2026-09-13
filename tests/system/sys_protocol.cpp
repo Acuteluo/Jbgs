@@ -34,6 +34,8 @@ struct Rig
     rclcpp::Node::SharedPtr driver;
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_l, pub_r;
     rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr pub_cmd;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_ann_l,
+        pub_ann_r;
     Monitor<std_msgs::msg::UInt8> ack;
     fs::path save_dir;
     int64_t stamp_ns = 0;
@@ -41,7 +43,7 @@ struct Rig
     void wait_ready(double timeout = 10.0)
     {
         jbgs_test::wait_matched(
-            driver, {pub_l, pub_r, pub_cmd}, timeout);
+            driver, {pub_l, pub_r, pub_cmd, pub_ann_l, pub_ann_r}, timeout);
     }
 
     void start(const std::string & name, double timeout_sec)
@@ -61,7 +63,10 @@ struct Rig
                 "-p input_topic:=/inspect_test/command "
                 "-p ack_topic:=/inspect_test/ack "
                 "-p left_topic:=/inspect_test/left/compressed "
-                "-p right_topic:=/inspect_test/right/compressed",
+                "-p right_topic:=/inspect_test/right/compressed "
+                "-p left_annotated_topic:=/inspect_test/left_ann/compressed "
+                "-p right_annotated_topic:=/inspect_test/right_ann/compressed "
+                "-p annot_gap_ms:=500.0",
             name);
 
         driver = rclcpp::Node::make_shared(name + "_driver");
@@ -71,6 +76,10 @@ struct Rig
             "/inspect_test/right/compressed", rclcpp::SensorDataQoS());
         pub_cmd = driver->create_publisher<std_msgs::msg::UInt8>(
             "/inspect_test/command", rclcpp::QoS(10));
+        pub_ann_l = driver->create_publisher<sensor_msgs::msg::CompressedImage>(
+            "/inspect_test/left_ann/compressed", rclcpp::SensorDataQoS());
+        pub_ann_r = driver->create_publisher<sensor_msgs::msg::CompressedImage>(
+            "/inspect_test/right_ann/compressed", rclcpp::SensorDataQoS());
         ack.attach(driver, "/inspect_test/ack", true);
     }
 
@@ -91,6 +100,30 @@ struct Rig
         msg.format = "jpeg";
         msg.data = jpeg;
         pub->publish(msg);
+    }
+
+    /// 发布与原图同时间戳的标注图(culvert_core 在真机上的职责由测试扮演)
+    void publish_ann(
+        rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr & pub,
+        int64_t stamp)
+    {
+        sensor_msgs::msg::CompressedImage msg;
+        msg.header.stamp.sec = static_cast<int32_t>(stamp / 1000000000LL);
+        msg.header.stamp.nanosec = static_cast<uint32_t>(stamp % 1000000000LL);
+        msg.header.frame_id = "test_ann";
+        msg.format = "jpeg";
+        msg.data = {0x41, 0x4E, 0x4E,
+                    static_cast<uint8_t>(stamp & 0xFF)};   // "ANN?"
+        pub->publish(msg);
+    }
+
+    /// 一对完整帧: 原图 + 各自标注图(时间戳相同)
+    void publish_pair_full(int64_t stamp, bool left_corrupt = false,
+                           bool right_corrupt = false)
+    {
+        publish_pair(stamp, left_corrupt, right_corrupt);
+        publish_ann(pub_ann_l, stamp);
+        publish_ann(pub_ann_r, stamp);
     }
 
     /// 左右同时各发一帧(时间戳相同), corrupt 侧发不可解码字节。
@@ -114,6 +147,13 @@ struct Rig
         pub_cmd->publish(msg);
     }
 
+    void send_release()   // 导航回 0x00: 解除完成后的门控
+    {
+        std_msgs::msg::UInt8 msg;
+        msg.data = 0x00;
+        pub_cmd->publish(msg);
+    }
+
     /// 静默 + 触发 + 静默: 消除"触发前后帧"的到达边界歧义。
     void trigger_in_quiet()
     {
@@ -123,6 +163,23 @@ struct Rig
     }
 
     void spin(double sec) { jbgs_test::spin_for(driver, sec); }
+
+    /// 统计状态字节进入 0x02 的"次数"(上升沿):
+    /// 协议是电平语义, 0x02 会以状态频率持续发布, 须按沿计数。
+    int ack02() const
+    {
+        int n = 0;
+        uint8_t prev = 0xFF;
+        for (const auto & m : ack.items)
+        {
+            if (m.msg->data == 0x02 && prev != 0x02)
+            {
+                ++n;
+            }
+            prev = m.msg->data;
+        }
+        return n;
+    }
 
     void stop()
     {
@@ -168,45 +225,82 @@ int main()
             if (k == 1) { s1 = s; }
             if (k == 2) { s2 = s; }
             if (k == 3) { s3 = s; }
-            rig.publish_pair(s);
+            rig.publish_pair_full(s);
             rig.spin(0.15);
         }
         // 等确认(最多 5s)
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < deadline &&
-               rig.ack.size() < 1)
+               rig.ack02() < 1)
         {
             rclcpp::spin_some(rig.driver);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         rig.spin(0.5);   // 观察窗口: 不应再来第二个 0x02
+        rig.send_release();   // 导航回 0x00
 
-        CHECKM(rig.ack.size() == 1,
-               "0x02 次数错误: " + std::to_string(rig.ack.size()));
-        CHECK(rig.ack.items[0].msg->data == 0x02);
+        CHECKM(rig.ack02() == 1,
+               "0x02 次数错误: " + std::to_string(rig.ack02()));
+        // 协议时序: 必须先观察到 0x01(保存中) 再观察到 0x02(拍完)
+        {
+            bool saw_saving = false;
+            int done_idx = -1;
+            for (size_t k = 0; k < rig.ack.items.size(); ++k)
+            {
+                const auto v = rig.ack.items[k].msg->data;
+                if (v == 0x01)
+                {
+                    saw_saving = true;
+                }
+                if (v == 0x02)
+                {
+                    done_idx = static_cast<int>(k);
+                    break;
+                }
+            }
+            CHECKM(saw_saving, "0x02 之前未观察到 0x01(保存中)状态");
+            (void)done_idx;
+        }
         const auto files = [&] {
             std::vector<std::string> v;
-            for (const auto & e : fs::directory_iterator(rig.save_dir))
+            for (const auto & e :
+                 fs::recursive_directory_iterator(rig.save_dir))
             {
-                v.push_back(e.path().filename().string());
+                if (e.is_regular_file())
+                {
+                    v.push_back(
+                        e.path().lexically_relative(rig.save_dir).string());
+                }
             }
             std::sort(v.begin(), v.end());
             return v;
         }();
-        CHECKM(files.size() == 2,
-               "run_save 文件数错误: " + std::to_string(files.size()));
-        const std::string l_name = std::to_string(s2) + "_left.jpg";
-        const std::string r_name = std::to_string(s2) + "_right.jpg";
-        CHECKM(files[0] == l_name, "左文件名错误: " + files[0] +
-                   " (期望 " + l_name + ")");
-        CHECKM(files[1] == r_name, "右文件名错误: " + files[1] +
-                   " (期望 " + r_name + ")");
-        // 内容 = 第 2 帧的 JPEG 字节(证明严格选帧, 非第 1/第 3 帧)
+        CHECKM(files.size() == 4,
+               "run_save 文件数错误(应为 4 = 2 原图 + 2 标注图): " +
+                   std::to_string(files.size()));
+        // 目录结构: raw/ 原图, annotated/ 标注图(4 个文件, 名字符合约定)
+        const std::string l_name = "raw/" + std::to_string(s2) + "_left.jpg";
+        const std::string r_name = "raw/" + std::to_string(s2) + "_right.jpg";
+        const std::string la_name =
+            "annotated/" + std::to_string(s2) + "_left.jpg";
+        const std::string ra_name =
+            "annotated/" + std::to_string(s2) + "_right.jpg";
+        CHECKM(files.size() == 4, "文件数错误: " + std::to_string(files.size()));
+        for (const auto & expect_name :
+             {la_name, ra_name, l_name, r_name})
+        {
+            CHECKM(std::find(files.begin(), files.end(), expect_name) !=
+                       files.end(),
+                   "缺文件: " + expect_name);
+        }
+        // 原图内容 = 第 2 帧的 JPEG 字节(证明严格选帧, 非第 1/第 3 帧)
         const auto expect = jbgs_test::make_jpeg(
             static_cast<int>(s2 % 1000000));
-        CHECKM(read_file(rig.save_dir / l_name) == expect, "左文件内容非第 2 帧");
-        CHECKM(read_file(rig.save_dir / r_name) == expect, "右文件内容非第 2 帧");
+        CHECKM(read_file(rig.save_dir / l_name) == expect, "左原图内容非第 2 帧");
+        CHECKM(read_file(rig.save_dir / r_name) == expect, "右原图内容非第 2 帧");
+        CHECKM(read_file(rig.save_dir / la_name).size() > 0, "左标注图缺失");
+        CHECKM(read_file(rig.save_dir / ra_name).size() > 0, "右标注图缺失");
         (void)s1; (void)s3;
         rig.stop();
         std::cout << "case A (正常选帧+重复触发忽略) PASS" << std::endl;
@@ -226,22 +320,25 @@ int main()
             if (k == 2) { s2 = s; }
             if (k == 3) { s3 = s; }
             // 左侧第 2 帧解码失败; 右侧全部有效
-            rig.publish_pair(s, k == 2, false);
+            rig.publish_pair_full(s, k == 2, false);
             rig.spin(0.15);
         }
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < deadline &&
-               rig.ack.size() < 1)
+               rig.ack02() < 1)
         {
             rclcpp::spin_some(rig.driver);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        CHECKM(rig.ack.size() == 1, "case B 0x02 次数错误");
+        CHECKM(rig.ack02() == 1, "case B 0x02 次数错误");
+        rig.send_release();
         // 左 = 第 3 帧(顺延), 右 = 第 2 帧(独立选帧)
-        CHECKM(fs::exists(rig.save_dir / (std::to_string(s3) + "_left.jpg")),
+        CHECKM(fs::exists(rig.save_dir / "raw" /
+                       (std::to_string(s3) + "_left.jpg")),
                "左侧未顺延取第 3 帧");
-        CHECKM(fs::exists(rig.save_dir / (std::to_string(s2) + "_right.jpg")),
+        CHECKM(fs::exists(rig.save_dir / "raw" /
+                       (std::to_string(s2) + "_right.jpg")),
                "右侧未取第 2 帧");
         size_t n_files = 0;
         for (const auto & e : fs::directory_iterator(rig.save_dir)) { ++n_files; }
@@ -266,7 +363,7 @@ int main()
             rig.spin(0.2);
         }
         rig.spin(2.5);                   // 越过 1.2s 超时窗
-        CHECKM(rig.ack.size() == 0, "左侧离线超时却发了 0x02");
+        CHECKM(rig.ack02() == 0, "左侧离线超时却发了 0x02");
         size_t n_files = 0;
         for (const auto & e : fs::directory_iterator(rig.save_dir)) { ++n_files; }
         CHECKM(n_files == 0, "超时周期却落了盘");
@@ -278,22 +375,24 @@ int main()
         {
             const int64_t s = rig.next_stamp();
             if (k == 2) { s2 = s; }
-            rig.publish_pair(s);
+            rig.publish_pair_full(s);
             rig.spin(0.15);
         }
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < deadline &&
-               rig.ack.size() < 1)
+               rig.ack02() < 1)
         {
             rclcpp::spin_some(rig.driver);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        CHECKM(rig.ack.size() == 1, "恢复后巡检未发 0x02");
-        CHECKM(fs::exists(rig.save_dir / (std::to_string(s2) + "_left.jpg")) &&
-                   fs::exists(rig.save_dir /
+        CHECKM(rig.ack02() == 1, "恢复后巡检未发 0x02");
+        CHECKM(fs::exists(rig.save_dir / "raw" /
+                       (std::to_string(s2) + "_left.jpg")) &&
+                   fs::exists(rig.save_dir / "raw" /
                               (std::to_string(s2) + "_right.jpg")),
                "恢复后巡检文件不齐");
+        rig.send_release();
         rig.stop();
         std::cout << "case C (左侧离线超时+恢复) PASS" << std::endl;
     }
@@ -316,11 +415,11 @@ int main()
         {
             const int64_t s = rig.next_stamp();
             if (k == 2) { s2 = s; }
-            rig.publish_pair(s);
+            rig.publish_pair_full(s);
             rig.spin(0.15);
         }
         rig.spin(1.0);
-        CHECKM(rig.ack.size() == 0, "写盘失败却发了 0x02");
+        CHECKM(rig.ack02() == 0, "写盘失败却发了 0x02");
         size_t n_files = 0;
         for (const auto & e : fs::directory_iterator(rig.save_dir)) { ++n_files; }
         CHECKM(n_files == 0, "写盘失败却残留半对文件");
@@ -333,20 +432,22 @@ int main()
         {
             const int64_t s = rig.next_stamp();
             if (k == 2) { s2b = s; }
-            rig.publish_pair(s);
+            rig.publish_pair_full(s);
             rig.spin(0.15);
         }
         const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < deadline &&
-               rig.ack.size() < 1)
+               rig.ack02() < 1)
         {
             rclcpp::spin_some(rig.driver);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        CHECKM(rig.ack.size() == 1, "恢复后巡检未发 0x02");
-        CHECKM(fs::exists(rig.save_dir / (std::to_string(s2b) + "_left.jpg")),
+        CHECKM(rig.ack02() == 1, "恢复后巡检未发 0x02");
+        CHECKM(fs::exists(rig.save_dir / "raw" /
+                       (std::to_string(s2b) + "_left.jpg")),
                "恢复后左文件缺失");
+        rig.send_release();
         rig.stop();
         std::cout << "case D (写盘失败+恢复) PASS" << std::endl;
     }

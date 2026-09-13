@@ -29,6 +29,31 @@ void IrSeepageDetector::setParams(const IrSeepageParams & params)
     {
         params_.clahe_grid = 2;
     }
+    // 时间一致性参数钳位: N>=1, 1<=M<=N(M>N 永远无法确认, 直接收敛)
+    if (params_.temporal_window < 1)
+    {
+        params_.temporal_window = 1;
+    }
+    if (params_.temporal_min_hits < 1)
+    {
+        params_.temporal_min_hits = 1;
+    }
+    if (params_.temporal_min_hits > params_.temporal_window)
+    {
+        params_.temporal_min_hits = params_.temporal_window;
+    }
+    // 参数整定会改变滑窗语义, 旧历史一律作废
+    reset();
+}
+
+void IrSeepageDetector::reset()
+{
+    hit_buf_.clear();
+    hit_buf_.shrink_to_fit();
+    hit_count_.release();
+    state_size_ = cv::Size();
+    hit_head_ = 0;
+    hit_fill_ = 0;
 }
 
 int IrSeepageDetector::oddKernel(int k)
@@ -63,7 +88,7 @@ int IrSeepageDetector::clampKernel(int k, const cv::Size & image_size)
     return std::min(k, max_odd);
 }
 
-IrSeepageResult IrSeepageDetector::detect(const cv::Mat & frame) const
+IrSeepageResult IrSeepageDetector::detect(const cv::Mat & frame)
 {
     IrSeepageResult out;
     if (frame.empty())
@@ -112,22 +137,72 @@ IrSeepageResult IrSeepageDetector::detect(const cv::Mat & frame) const
     // ---- 4. Diff = B - I: 渗水在白热图中偏暗 -> Diff 为正 ----
     cv::subtract(out.background, src_f, out.diff);
 
-    // ---- 5. 二值化 + 形态学(开运算去单点噪声, 闭运算连片) ----
+    // ---- 5. 单帧命中图: Diff > 阈值 -> 0/255 二值 ----
     cv::Mat bin;
     cv::threshold(out.diff, bin, params_.diff_thresh, 255.0, cv::THRESH_BINARY);
     bin.convertTo(bin, CV_8U);
 
+    // ---- 6. 时间一致性确认(像素级): 最近 N 帧滑窗内命中 >= M 才保留 ----
+    // 环形缓冲增量维护命中计数: 覆盖最旧帧前先减去它的贡献, 再加新帧,
+    // 避免每帧对整窗求和。渗水斑在停点画面中近似静止, 真实渗水会持续
+    // 命中; 单帧噪声/JPEG 块效应/AGC 抖动难以连续命中, 被自然滤除。
+    cv::Mat confirmed;
+    if (params_.temporal_window <= 1)
+    {
+        // 单帧模式: 关闭滑窗, 与无时间一致性的旧行为完全一致
+        confirmed = bin;
+        reset();
+    }
+    else
+    {
+        // 首帧或帧尺寸变化 => 状态按新尺寸重建(旧历史无法复用)
+        if (bin.size() != state_size_)
+        {
+            reset();
+            state_size_ = bin.size();
+            hit_buf_.assign(params_.temporal_window, cv::Mat());
+            hit_count_ = cv::Mat::zeros(bin.size(), CV_16U);
+        }
+        // 命中图归一为 0/1, 便于累加
+        cv::Mat hit01;
+        bin.convertTo(hit01, CV_8U, 1.0 / 255.0);
+
+        if (hit_fill_ == hit_buf_.size())
+        {
+            // 窗口已满: 先移除被覆盖的最旧帧的贡献
+            cv::subtract(hit_count_, hit_buf_[hit_head_], hit_count_,
+                         cv::noArray(), CV_16U);
+        }
+        else
+        {
+            ++hit_fill_;
+        }
+        hit_buf_[hit_head_] = hit01;
+        cv::add(hit_count_, hit01, hit_count_, cv::noArray(), CV_16U);
+        hit_head_ = (hit_head_ + 1) % hit_buf_.size();
+
+        // 确认掩膜: 命中次数 >= min_hits(经 32F 中转做阈值, 16U 兼容性稳)
+        cv::Mat count_f;
+        hit_count_.convertTo(count_f, CV_32F);
+        cv::threshold(count_f, confirmed,
+                      static_cast<double>(params_.temporal_min_hits) - 0.5,
+                      255.0, cv::THRESH_BINARY);
+        confirmed.convertTo(confirmed, CV_8U);
+        out.hit_count = hit_count_.clone();
+    }
+
+    // ---- 7. 形态学(开运算去单点噪声, 闭运算连片) ----
     const cv::Mat open_kernel = cv::getStructuringElement(
         cv::MORPH_ELLIPSE,
         cv::Size(params_.morph_ksize, params_.morph_ksize));
-    cv::morphologyEx(bin, out.mask, cv::MORPH_OPEN, open_kernel);
+    cv::morphologyEx(confirmed, out.mask, cv::MORPH_OPEN, open_kernel);
 
     const int close_k = clampKernel(params_.morph_close_ksize, out.mask.size());
     const cv::Mat close_kernel = cv::getStructuringElement(
         cv::MORPH_ELLIPSE, cv::Size(close_k, close_k));
     cv::morphologyEx(out.mask, out.mask, cv::MORPH_CLOSE, close_kernel);
 
-    // ---- 6. 连通域 -> 区域候选(小面积/碎轮廓过滤) ----
+    // ---- 8. 连通域 -> 区域候选(小面积/碎轮廓过滤) ----
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(out.mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
@@ -152,6 +227,12 @@ IrSeepageResult IrSeepageDetector::detect(const cv::Mat & frame) const
         cv::drawContours(region_mask, std::vector<std::vector<cv::Point>>{contour},
                          0, cv::Scalar(255), cv::FILLED);
         region.mean_diff = static_cast<float>(cv::mean(out.diff, region_mask)[0]);
+        // 区域内平均命中帧数: 稳定渗水应接近滑窗长度 N(置信辅助量)
+        if (!out.hit_count.empty())
+        {
+            region.mean_hits =
+                static_cast<float>(cv::mean(out.hit_count, region_mask)[0]);
+        }
         max_area = std::max(max_area, area);
         candidates.push_back(std::move(region));
     }
@@ -193,7 +274,9 @@ void IrSeepageDetector::drawOverlay(
             cv::drawContours(bgr, std::vector<std::vector<cv::Point>>{region.contour},
                              0, color, 2, cv::LINE_AA);
         }
-        std::string label = cv::format("dT=%.1f A=%.0f", region.mean_diff, region.area_px);
+        std::string label = cv::format("dT=%.1f A=%.0f H=%.1f",
+                                       region.mean_diff, region.area_px,
+                                       region.mean_hits);
         cv::Point text(region.bbox.x, std::max(region.bbox.y - 6, 14));
         cv::putText(bgr, label, text, cv::FONT_HERSHEY_SIMPLEX, 0.45,
                     cv::Scalar(0, 0, 0), 3);

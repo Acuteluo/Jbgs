@@ -25,14 +25,14 @@ DG-202603 涵洞巡检赛题感知系统：双大恒相机（左/右）+ 红外�
 | `sim_mode` | 热插拔模拟总开关（无真机时置 true） | `true` |
 | `log_level` | ROS 日志级别 debug/info/warn/error | `info` |
 | `save_dir` | 巡检图片保存目录（相对工程根） | `run_save` |
-| `input_topic` / `ack_topic` | 巡检指令输入 / 确认输出话题（UInt8） | `/inspection/command` / `/inspection/ack` |
+| `input_topic` / `ack_topic` | 导航→视觉指令 / 视觉→导航状态话题（UInt8 电平, 20Hz） | `/vision_capture_cmd` / `/vision_capture_status` |
 | `frame_timeout_sec` | 巡检目标帧等待超时 | `3.0` |
 | `target_frame_index` | 取 t 后第 N 帧 | `2` |
 | `enable_yolo` / `enable_ir_seepage` / `enable_sensor` | 模型与传感器开关 | `true` |
 | `camera_config_files` | 左/右/红外相机设备 JSON 路径 | 见下 |
 | `sim.*` | 模拟热插拔时间窗（初始缺失/中途断连时刻与时长，每设备独立） | 见文件 |
 
-相机设备定义：`config/galaxy_camera1_.json`（左）、`config/galaxy_camera_2.json`（右）、`config/infrared_camera.json`（红外）。含设备 ID（serial_number/user_id/ip/device_index，可留空）、别名、内参/分辨率占位。**真机未接入时不要伪造设备 ID**：留空或用默认，启动后从日志中抄录实际 SN/IP 回填。
+相机设备定义：`config/galaxy_camera_1.json`（左）、`config/galaxy_camera_2.json`（右）、`config/infrared_camera.json`（红外）。含设备 ID（serial_number/user_id/ip/device_index，可留空）、别名、内参/分辨率占位。**真机未接入时不要伪造设备 ID**：留空或用默认，启动后从日志中抄录实际 SN/IP 回填。
 
 launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 = 尊重 launch.json/yaml）：
 
@@ -77,9 +77,10 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 | `/sensor/env` | sensor_interfaces/EnvData | 温湿度/CO2（1Hz） |
 | `/core_node/status` | String | 1Hz 心跳：各路帧率 + on/OFF 离线标识 + 传感器摘要 |
 | `/core_node/save_image` | Empty | 调试：按 S 键保存总图 |
-| `/inspection/command` | UInt8 | 巡检指令（0x01） |
-| `/inspection/ack` | UInt8 | 巡检确认（0x02） |
-| `/inspection_node/status` | String | 巡检状态机状态（10Hz） |
+| `/vision_capture_cmd` | UInt8 | 导航→视觉指令（0x00 空闲 / 0x01 触发, 20Hz 电平） |
+| `/vision_capture_status` | UInt8 | 视觉→导航状态（0x00 空闲 / 0x01 保存中 / 0x02 拍完） |
+| `/inspection_node/status` | String | 巡检状态机调试状态（ARMED/SAVING/IDLE…） |
+| `/core_node/left_annotated` `/right_annotated` | CompressedImage | 模型处理完画框后的标注帧（窗格分辨率、含信息条；有订阅者时才编码） |
 
 ## 解耦与热插拔设计
 
@@ -139,17 +140,24 @@ Culvert-Visual-Inspection-main/   红外参考工程(有 COLCON_IGNORE, 不参�
    ros2 run galaxy_camera_dual camera_setup_wizard --check  # 只检查不写入
    ```
 
-   向导流程：① 枚举大恒相机（失败打印网卡网段/MTU/防火墙/SDK 排障清单）；② 逐台**全屏预览**两台大恒，测试者按 ENTER 结束预览并回答是左侧还是右侧，序列号自动绑定进对应 JSON；③ 逐个 /dev/video 候选预览确认红外热像（USB 直插直用，无需配置），写入 infrared_camera.json；④ 对每个串口候选发 Modbus 读数并显示 ~6 秒实时温湿度/CO2，确认后写入 sensor_driver.yaml；⑤ 四模块全部确认后自动把 launch.json 的 `sim_mode` 置 false。被修改文件均备份为 `*.bak`。
+   向导流程：① 枚举大恒相机（失败打印网卡网段/MTU/防火墙/SDK 排障清单；检测到"相机网段与网卡不匹配"时可自动 sudo 修复，网卡无地址时可自举加 link-local 后重新枚举）；② 逐台**全屏预览**两台大恒，测试者按 ENTER 结束预览并回答是左侧还是右侧，序列号自动绑定进对应 JSON——**预览窗实时显示 fps，不足 5 帧时 ENTER 被禁用**（防止把无流相机绑进配置，ESC 可跳过）；③ 逐个 /dev/video 候选预览确认红外热像（USB 直插直用，无需配置），写入 infrared_camera.json；④ 对每个串口候选发 Modbus 读数并显示 ~6 秒实时温湿度/CO2，确认后写入 sensor_driver.yaml；⑤ 四模块全部确认后自动把 launch.json 的 `sim_mode` 置 false。被修改文件均备份为 `*.bak`。
+
+   **网卡名从哪里来**：`enx00e04c1e2b40` 这类名字由 systemd/udev 按"USB 网卡"规则自动生成——`en`(Ethernet) + `x`(MAC 寻址) + 该网卡 MAC 地址（`00:e0:4c:1e:2b:40`）。**每台电脑、每个 USB 网卡的名字都不同**，不要照抄文档。向导运行时会列出本机全部网卡名供选择；只有一块有线网卡时直接回车即可。
 
 1. （手动方式）相机 JSON 回填两台大恒的 serial_number（首次真机启动后从日志抄录），`sim_mode` 置 false（或 `./run.sh sim:=false`）。
 2. 红外 `config/infrared_camera.json` 填 device_path/device_index；确认 `/dev/video*` 权限。
 3. 传感器 `src/tas_sensor_driver/config/sensor_driver.yaml` 确认 ttyUSB 与 Modbus 地址；`sim_mode: false`。
 4. 标定后回填三相机内参（JSON intrinsics + 包内 camera_info yaml）。
-5. 检查网卡 MTU 与巨帧（camera JSON packet_size 8192 需 MTU≥9000 或改小）。
+5. 检查网卡 MTU 与巨帧（camera JSON packet_size 8192 需 MTU≥9000 或改小）；同一交换机上如还有其他发流设备（如 Mid360 雷达），会计入上行带宽预算。
 
 ## 已知限制
 
-- 真机尚未验证：相机曝光/触发时序、红外 UVC 帧率、串口时序均只在模拟/代码路径层面对齐。
+- **真机验证状态（2026-09-13 首轮实测）**：
+  - ✓ 传感器：/dev/ttyUSB0 Modbus 实测通过（T/RH/CO2 实时数据、CRC 校验通过）
+  - ✓ 红外：/dev/video2 UVC 实测 25.0fps 稳定（原生 256×192）
+  - ✓ 双大恒：枚举/打开/软触发全通；**GVSP 流量仍有丢包**（千兆链路下仅 1-6fps + 残帧），与包大小/帧率/限速/雷达无关，疑似交换机端口或 RTL8153 USB 网卡对连续巨帧突发的丢包，待物理层排查（换直连/换线/换端口对照）
+  - ✓ 配置向导：真机端到端跑通（网段自举修复 → 枚举 → 预览绑定左右 → 红外确认 → 传感器确认 → 自动写配置并切 sim_mode=false）
+  - 注意：双大恒 20fps×2 台共 192MB/s 超千兆线速，真机建议在两台 JSON 里把 frame_rate_hz 降到 8 左右
 - 巡检"t 后第 2 帧"以巡检节点**到达顺序**为准；DDS 传输有毫秒级延迟，测试用静默间隔消除边界歧义。
 - 保存中的 0x01 用 try_lock 拒绝（不排队）；周期结束后再来的 0x01 视为新一轮巡检。
 - Release 构建类型未启用：-O3 会误报 galaxy SDK 封装的 stringop-overflow。

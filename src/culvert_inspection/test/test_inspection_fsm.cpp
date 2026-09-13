@@ -113,6 +113,19 @@ struct Harness
         fsm->onFrame(side, f);
     }
 
+    /// 发送与已捕获原图配对的标注图(时间戳一致, 必然配对成功)。
+    void ann(InspectionFsm::Side & side)
+    {
+        ASSERT_TRUE(side.captured);
+        culvert_inspection::InspectionFrame f;
+        const std::string jpeg = "ANN" + std::to_string(side.stamp_ns);
+        bytes.push_back(jpeg);
+        f.data = reinterpret_cast<const uint8_t *>(bytes.back().data());
+        f.size = bytes.back().size();
+        f.stamp_ns = side.stamp_ns;
+        fsm->onAnnotatedFrame(side, f);
+    }
+
     void trigger()
     {
         ASSERT_EQ(fsm->onCommand(0x01), 1);
@@ -139,19 +152,24 @@ TEST(InspectionFsm, SelectsExactlySecondFrameAfterTrigger)
     ASSERT_EQ(h.fsm->state(), FsmState::kArmed);   // 右侧未齐 -> 尚未完成
     EXPECT_EQ(h.ack_count, 0);
 
-    // 左侧第 3 帧不应改变已捕获内容; 右侧第 2 帧补齐 -> 完成
+    // 左侧第 3 帧不应改变已捕获内容; 右侧第 2 帧补齐原图 -> 仍需标注图
     h.frame(h.left(), "after3", 103);
     ASSERT_EQ(h.ack_count, 0);                     // 单侧不触发
     h.frame(h.right(), "after2r", 102);
-    ASSERT_EQ(h.fsm->state(), FsmState::kIdle);    // 双帧齐 -> 完成
+    ASSERT_EQ(h.ack_count, 0);                     // 标注图未齐 -> 不写盘
+    h.ann(h.left());
+    h.ann(h.right());
+    ASSERT_EQ(h.fsm->state(), FsmState::kIdle);    // 四者齐 -> 完成
     ASSERT_EQ(h.ack_count, 1);
 
-    // 文件名 = 各自所选第 2 帧的时间戳; 内容 = 该帧字节
-    ASSERT_EQ(h.files.size(), 2u);
-    EXPECT_EQ(h.files["/tmp/ut_save/102_left.jpg"],
+    // 文件名 = 各自所选第 2 帧的时间戳; 原图存 raw/, 标注图存 annotated/
+    ASSERT_EQ(h.files.size(), 4u);
+    EXPECT_EQ(h.files["/tmp/ut_save/raw/102_left.jpg"],
               std::vector<uint8_t>({'a', 'f', 't', 'e', 'r', '2'}));
-    EXPECT_EQ(h.files["/tmp/ut_save/102_right.jpg"],
+    EXPECT_EQ(h.files["/tmp/ut_save/raw/102_right.jpg"],
               std::vector<uint8_t>({'a', 'f', 't', 'e', 'r', '2', 'r'}));
+    EXPECT_EQ(h.files["/tmp/ut_save/annotated/102_left.jpg"],
+              std::vector<uint8_t>({'A', 'N', 'N', '1', '0', '2'}));
 }
 
 TEST(InspectionFsm, TriggerMomentIsFrameZero)
@@ -164,9 +182,11 @@ TEST(InspectionFsm, TriggerMomentIsFrameZero)
     h.frame(h.left(), "n2", 202);
     h.frame(h.right(), "n1r", 201);
     h.frame(h.right(), "n2r", 202);
+    h.ann(h.left());
+    h.ann(h.right());
     EXPECT_EQ(h.ack_count, 1);
-    EXPECT_TRUE(h.files.count("/tmp/ut_save/202_left.jpg"));
-    EXPECT_FALSE(h.files.count("/tmp/ut_save/201_left.jpg"));
+    EXPECT_TRUE(h.files.count("/tmp/ut_save/raw/202_left.jpg"));
+    EXPECT_FALSE(h.files.count("/tmp/ut_save/raw/201_left.jpg"));
 }
 
 // ----------------------------------------------------------------------
@@ -184,11 +204,13 @@ TEST(InspectionFsm, SkipsUndecodableFramesAndWaitsForLaterOnes)
     EXPECT_EQ(h.fsm->state(), FsmState::kArmed);
     h.frame(h.left(), "ok3", 302);
     h.frame(h.right(), "ok3r", 302);
+    h.ann(h.left());
+    h.ann(h.right());
     EXPECT_EQ(h.ack_count, 1);
     // 左侧用了第 3 帧(302), 右侧用的是其第 2 帧(302)
-    EXPECT_TRUE(h.files.count("/tmp/ut_save/302_left.jpg"));
-    EXPECT_TRUE(h.files.count("/tmp/ut_save/302_right.jpg"));
-    EXPECT_FALSE(h.files.count("/tmp/ut_save/301_right.jpg"));
+    EXPECT_TRUE(h.files.count("/tmp/ut_save/raw/302_left.jpg"));
+    EXPECT_TRUE(h.files.count("/tmp/ut_save/raw/302_right.jpg"));
+    EXPECT_FALSE(h.files.count("/tmp/ut_save/raw/301_right.jpg"));
 }
 
 // ----------------------------------------------------------------------
@@ -206,9 +228,11 @@ TEST(InspectionFsm, DuplicateTriggerWhileArmedIsIgnored)
     h.frame(h.left(), "a2", 402);
     h.frame(h.right(), "a1", 401);
     h.frame(h.right(), "a2", 402);
+    h.ann(h.left());
+    h.ann(h.right());
     // 只有一次巡检完成, 只发一次 0x02
     EXPECT_EQ(h.ack_count, 1);
-    EXPECT_EQ(h.files.size(), 2u);
+    EXPECT_EQ(h.files.size(), 4u);
     // 若重复触发未被忽略, 第二周期会再选新帧 -> 文件数将 > 2
 }
 
@@ -244,9 +268,11 @@ TEST(InspectionFsm, TimeoutAbandonsCycleWithoutAckThenRecovers)
     h.frame(h.left(), "L2", 511);
     h.frame(h.right(), "R1", 510);
     h.frame(h.right(), "R2", 511);
+    h.ann(h.left());
+    h.ann(h.right());
     EXPECT_EQ(h.fsm->state(), FsmState::kIdle);
     EXPECT_EQ(h.ack_count, 1);
-    EXPECT_EQ(h.files.size(), 2u);
+    EXPECT_EQ(h.files.size(), 4u);
 }
 
 TEST(InspectionFsm, TimeoutNotFiredWhileProgressContinues)
@@ -287,11 +313,14 @@ TEST(InspectionFsm, WriteFailureSuppressesAckThenRecovers)
     h.frame(h.left(), "L2", 702);
     h.frame(h.right(), "R1", 701);
     h.frame(h.right(), "R2", 702);
+    h.ann(h.left());
+    h.ann(h.right());
     EXPECT_EQ(h.fsm->state(), FsmState::kIdle);   // 已放弃(回 Idle)
     EXPECT_EQ(h.ack_count, 0);                    // 绝不误发 0x02
     EXPECT_TRUE(h.files.empty());                 // 半对文件已被清理
-    ASSERT_EQ(h.removed.size(), 1u);              // 右侧成功文件被删除
+    ASSERT_EQ(h.removed.size(), 2u);              // 右侧原图+标注图被删除
     EXPECT_NE(h.removed[0].find("_right.jpg"), std::string::npos);
+    EXPECT_NE(h.removed[1].find("_right.jpg"), std::string::npos);
 
     // 下一巡检(写盘恢复)正常
     h.fail_path_contains.clear();
@@ -300,8 +329,10 @@ TEST(InspectionFsm, WriteFailureSuppressesAckThenRecovers)
     h.frame(h.left(), "L2", 711);
     h.frame(h.right(), "R1", 710);
     h.frame(h.right(), "R2", 711);
+    h.ann(h.left());
+    h.ann(h.right());
     EXPECT_EQ(h.ack_count, 1);
-    EXPECT_EQ(h.files.size(), 2u);
+    EXPECT_EQ(h.files.size(), 4u);
 }
 
 // ----------------------------------------------------------------------
@@ -322,10 +353,12 @@ TEST(InspectionFsm, SidesSelectFramesIndependently)
     // 左侧到第 2 帧 -> 完成; 右侧文件必须是 802(第 2 帧)
     h.frame(h.left(), "L1", 810);
     h.frame(h.left(), "L2", 811);
+    h.ann(h.left());
+    h.ann(h.right());
     EXPECT_EQ(h.ack_count, 1);
-    EXPECT_TRUE(h.files.count("/tmp/ut_save/802_right.jpg"));
-    EXPECT_TRUE(h.files.count("/tmp/ut_save/811_left.jpg"));
-    EXPECT_FALSE(h.files.count("/tmp/ut_save/803_right.jpg"));
+    EXPECT_TRUE(h.files.count("/tmp/ut_save/raw/802_right.jpg"));
+    EXPECT_TRUE(h.files.count("/tmp/ut_save/raw/811_left.jpg"));
+    EXPECT_FALSE(h.files.count("/tmp/ut_save/raw/803_right.jpg"));
 }
 
 // ----------------------------------------------------------------------
@@ -345,8 +378,10 @@ TEST(InspectionFsm, ConfigurableTargetFrameIndex)
     EXPECT_EQ(h.fsm->state(), FsmState::kArmed);   // 第 3 帧未到
     h.frame(h.left(), "L3", 903);
     h.frame(h.right(), "R3", 903);
+    h.ann(h.left());
+    h.ann(h.right());
     EXPECT_EQ(h.ack_count, 1);
-    EXPECT_TRUE(h.files.count("/tmp/ut_save/903_left.jpg"));
+    EXPECT_TRUE(h.files.count("/tmp/ut_save/raw/903_left.jpg"));
 }
 
 // ----------------------------------------------------------------------
@@ -466,6 +501,15 @@ TEST(InspectionFsm, ConcurrentTriggerFrameStress)
             // 与生产一致: 计数/处理统一在锁内(无无锁快路径)
             std::lock_guard<std::mutex> lk(state_mutex);
             fsm->onFrame(side, f);
+            if (side.captured && !side.ann_captured)
+            {
+                culvert_inspection::InspectionFrame af;
+                const std::string ann = "ANN" + std::to_string(seq);
+                af.data = reinterpret_cast<const uint8_t *>(ann.data());
+                af.size = ann.size();
+                af.stamp_ns = f.stamp_ns;   // 与原图同时间戳 => 必然配对
+                fsm->onAnnotatedFrame(side, af);
+            }
             logged.store(seq, std::memory_order_relaxed);
         }
     };

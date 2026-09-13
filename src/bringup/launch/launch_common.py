@@ -10,7 +10,7 @@
 #
 # 工程根目录定位: 环境变量 JBGS_ROOT(run.sh 导出)优先;
 # 否则从当前工作目录向上搜索含 config/launch.json 的目录。
-# 相机设备 ID/别名/内参占位读取 config/galaxy_camera1_.json、
+# 相机设备 ID/别名/内参占位读取 config/galaxy_camera_1.json、
 # config/galaxy_camera_2.json、config/infrared_camera.json。
 
 import json
