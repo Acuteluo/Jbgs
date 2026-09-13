@@ -59,7 +59,12 @@ fi
 
 # ---- 5. 重新 source(刚重建的 install)并启动总 launch ----
 # shellcheck disable=SC1091
+# colcon 生成的 setup.bash 直接引用 $COLCON_TRACE；在本脚本的 `set -u`
+# 下，未设置该变量会被 Bash 当作错误。与 env/env.sh 一致，仅在 source
+# 期间关闭 nounset，随后立即恢复严格模式。
+set +u
 source "$PROJECT_ROOT/install/setup.bash"
+set -u
 
 # 退出时确保 launch 进程组整体终止(无残留节点/子进程)
 LAUNCH_PID=""

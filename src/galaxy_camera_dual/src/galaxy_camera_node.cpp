@@ -1010,18 +1010,52 @@ void GalaxyCameraNode::applyCameraSettings(CameraContext & ctx)
     }
 
     // 老款 MER 固件可能没有 DeviceLinkThroughputLimit，但该系列支持
-    // GevSCPD/GX_INT_GEV_PACKETDELAY。仅当用户按具体固件实测后配置了
-    // 非零值时才启用；tick 周期随固件而异，写死过大值会让单帧传输超过
-    // 触发周期，造成隔次触发被忽略、10Hz 实际只剩约 5Hz。
-    if (!throughput_configured && ctx.packet_delay > 0)
+    // GevSCPD/GX_INT_GEV_PACKETDELAY。packet_delay=-1 表示按设备报告的
+    // timestamp tick 自动换算为约 42 MB/s：双 5MP 相机共用 1GbE 时总
+    // 负载约 672 Mb/s，既不让 USB 网卡被单帧 UDP 微突发打满，也能在
+    // 8 Hz 的 125 ms 周期内传完一帧。正值仍保留给已实测的人工值。
+    int64_t packet_delay = ctx.packet_delay;
+    if (!throughput_configured && packet_delay < 0)
     {
-        if (ctx.device->setInt(GX_INT_GEV_PACKETDELAY, ctx.packet_delay))
+        int64_t tick_frequency = 0;
+        if (ctx.device->getInt(GX_INT_TIMESTAMP_TICK_FREQUENCY,
+                               &tick_frequency) && tick_frequency > 0)
+        {
+            constexpr double kFallbackBytesPerSecond = 42.0 * 1000.0 * 1000.0;
+            const double packet_seconds =
+                static_cast<double>(ctx.packet_size > 0 ? ctx.packet_size : 8192) /
+                kFallbackBytesPerSecond;
+            packet_delay = std::max<int64_t>(1, static_cast<int64_t>(
+                std::llround(packet_seconds * static_cast<double>(tick_frequency))));
+            RCLCPP_INFO(
+                get_logger(),
+                "Camera '%s': auto GVSP packet delay %ld ticks "
+                "(tick %.0f Hz, target 42 MB/s)",
+                ctx.name.c_str(), static_cast<long>(packet_delay),
+                static_cast<double>(tick_frequency));
+        }
+        else
+        {
+            // MER-500-14GC 的部分固件实现了 GevSCPD，却没有公开
+            // TimestampTickFrequency。6000 tick 是本机双 MER-500-14GC
+            // 实测能在 8 Hz 周期内传完一帧的保守值；更大的 15000 tick
+            // 虽可消除残帧，却会使相机错过隔次软件触发而只剩约 4 Hz。
+            packet_delay = 6000;
+            RCLCPP_WARN(
+                get_logger(), "Camera '%s': timestamp tick frequency unavailable; "
+                "using conservative MER fallback GVSP delay %ld ticks",
+                ctx.name.c_str(), static_cast<long>(packet_delay));
+        }
+    }
+    if (!throughput_configured && packet_delay > 0)
+    {
+        if (ctx.device->setInt(GX_INT_GEV_PACKETDELAY, packet_delay))
         {
             RCLCPP_INFO(
                 get_logger(),
                 "Camera '%s': GVSP packet delay set to %ld ticks "
                 "(throughput-limit fallback)",
-                ctx.name.c_str(), static_cast<long>(ctx.packet_delay));
+                ctx.name.c_str(), static_cast<long>(packet_delay));
         }
         else
         {
@@ -1029,7 +1063,7 @@ void GalaxyCameraNode::applyCameraSettings(CameraContext & ctx)
                 get_logger(),
                 "Camera '%s': failed to set GVSP packet delay %ld; use a "
                 "separate NIC if incomplete frames persist",
-                ctx.name.c_str(), static_cast<long>(ctx.packet_delay));
+                ctx.name.c_str(), static_cast<long>(packet_delay));
         }
     }
 

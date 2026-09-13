@@ -4,7 +4,7 @@
   "show_windows": true,
   "fullscreen": true,
   "in_trulyworking": true,
-  "sim_mode": true,
+  "sim_mode": false,
   "log_level": "info",
   "save_dir": "run_save",
 

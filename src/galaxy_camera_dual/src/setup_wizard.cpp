@@ -349,11 +349,412 @@ private:
 };
 
 // ----------------------------------------------------------------------
+// GigE 网段自动修复: SDK 以网卡"主地址"为源 IP, 相机不同段时
+// 枚举正常但 open 超时(-14)。检测并(经确认后)自动修复。
+// ----------------------------------------------------------------------
+
+/// 列出主机 IPv4: (地址, 网卡名)。
+/// `ip -o addr` 格式为 `8: enx... inet 169.254.10.10/16 ...`，
+/// 接口名不带 `dev` 关键字；不要按普通 `ip addr` 的格式解析。
+std::vector<std::pair<std::string, std::string>> list_host_ipv4()
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    if (auto * fp = popen("ip -4 -o addr show 2>/dev/null", "r"))
+    {
+        char line[512];
+        while (fgets(line, sizeof(line), fp) != nullptr)
+        {
+            std::istringstream ss{std::string(line)};
+            std::string index_colon;
+            std::string dev;
+            std::string family;
+            std::string cidr;
+            if (!(ss >> index_colon >> dev >> family >> cidr) ||
+                family != "inet")
+            {
+                continue;
+            }
+            const size_t slash = cidr.find('/');
+            if (slash == std::string::npos)
+            {
+                continue;
+            }
+            out.emplace_back(cidr.substr(0, slash), dev);
+        }
+        pclose(fp);
+    }
+    return out;
+}
+
+/// 相机网段(前两段, 如 169.254)
+std::string cam_subnet(const std::string & ip)
+{
+    const size_t d1 = ip.find('.');
+    const size_t d2 = (d1 == std::string::npos) ?
+        std::string::npos : ip.find('.', d1 + 1);
+    return (d2 == std::string::npos) ? ip : ip.substr(0, d2);
+}
+
+/// 配置 USB/以太网网卡以承受 5MP GigE 的 UDP 突发。
+/// 调用者已经通过 sudo -v，nic 只能来自已校验的交互输入。MTU 和 RX
+/// descriptor 均是易失设置，因此向导每次执行都会核验并可再次修复。
+bool configure_gige_nic(const std::string & nic)
+{
+    const std::string mtu_cmd =
+        "sudo ip link set dev " + nic + " mtu 9000";
+    if (std::system(mtu_cmd.c_str()) != 0)
+    {
+        std::cout << "  [错误] 无法把 " << nic
+                  << " 设为 MTU 9000；GigE 相机预览可能持续残帧" << std::endl;
+        return false;
+    }
+
+    // RTL8153 的默认 RX ring 常仅 100，而一张 5MP/8192B 包的图像约有
+    // 615 个 UDP 包。把 ring 提到驱动公布的上限，避免单帧突发先于 NAPI
+    // 消费而在网卡内被丢弃。某些网卡没有可调 ring，明确提示但不误报。
+    const std::string ring_cmd =
+        "sudo ethtool -G " + nic + " rx 4096";
+    if (std::system(ring_cmd.c_str()) != 0)
+    {
+        std::cout << "  [警告] " << nic << " 不支持 RX ring=4096；"
+                  << "请运行 ethtool -g " << nic
+                  << "，将 RX 设置为其最大值" << std::endl;
+    }
+    else
+    {
+        std::cout << "  [已修复] " << nic
+                  << " 已设 MTU 9000、RX ring 4096" << std::endl;
+    }
+    return true;
+}
+
+/// 将相机交换机网卡的易失配置做成 device-unit 绑定服务。扩展坞重插会
+/// 重建 RTL8153 接口，普通 `ip addr add` / `ethtool -G` 随即失效；该
+/// 服务在该网卡每次出现时清理其旧地址、恢复相机网段、巨帧与 RX ring。
+bool install_gige_recovery_service(const std::string & nic,
+                                   const std::string & subnet)
+{
+    if (!ask_yes("  是否安装扩展坞重连后自动恢复 GigE 网络的系统服务?", true))
+    {
+        std::cout << "  [提示] 未安装持久恢复服务；扩展坞重插后需再次运行向导"
+                  << std::endl;
+        return true;
+    }
+    const std::string service = "jbgs-gige-" + nic + ".service";
+    const fs::path tmp = fs::path("/tmp") / service;
+    std::ofstream out(tmp);
+    if (!out)
+    {
+        std::cout << "  [错误] 无法创建持久网络服务临时文件" << std::endl;
+        return false;
+    }
+    out << "[Unit]\n"
+        << "Description=JBGS GigE camera network recovery for " << nic << "\n"
+        << "BindsTo=sys-subsystem-net-devices-" << nic << ".device\n"
+        << "After=sys-subsystem-net-devices-" << nic << ".device\n\n"
+        << "[Service]\nType=oneshot\n"
+        << "ExecStart=/usr/sbin/ip link set dev " << nic << " mtu 9000\n"
+        << "ExecStart=/usr/sbin/ip -4 addr flush dev " << nic << " scope global\n"
+        << "ExecStart=/usr/sbin/ip addr add " << subnet << ".1/16 dev " << nic << "\n"
+        << "ExecStart=/usr/sbin/ethtool -G " << nic << " rx 4096\n"
+        << "RemainAfterExit=yes\n\n"
+        << "[Install]\nWantedBy=sys-subsystem-net-devices-" << nic << ".device\n";
+    out.close();
+    const std::string cmd =
+        "sudo install -m 0644 " + tmp.string() + " /etc/systemd/system/" + service +
+        " && sudo systemctl daemon-reload && sudo systemctl enable --now " + service;
+    if (std::system(cmd.c_str()) != 0)
+    {
+        std::cout << "  [错误] 持久恢复服务安装失败" << std::endl;
+        return false;
+    }
+    std::cout << "  [已修复] 已安装 " << service
+              << "；扩展坞重连后将自动恢复 GigE 网络" << std::endl;
+    return true;
+}
+
+/// 读取 `ethtool -g` 的 Current hardware settings/RX 值；不可读返回 -1。
+int current_rx_ring(const std::string & nic)
+{
+    const std::string cmd = "ethtool -g " + nic + " 2>/dev/null";
+    auto * fp = popen(cmd.c_str(), "r");
+    if (fp == nullptr)
+    {
+        return -1;
+    }
+    bool current_section = false;
+    int result = -1;
+    char line[256];
+    while (fgets(line, sizeof(line), fp) != nullptr)
+    {
+        const std::string value(line);
+        if (value.find("Current hardware settings:") != std::string::npos)
+        {
+            current_section = true;
+            continue;
+        }
+        if (current_section && value.rfind("RX:", 0) == 0)
+        {
+            std::istringstream ss(value.substr(3));
+            ss >> result;
+            break;
+        }
+    }
+    pclose(fp);
+    return result;
+}
+
+/// SDK 会使用接口列出的首个 IPv4 作为 GigE 控制通道源地址。返回该地址
+/// 的 CIDR，供向导识别“同一接口上陈旧主地址”的精确修复目标。
+std::string primary_ipv4_cidr(const std::string & nic)
+{
+    const std::string cmd = "ip -4 -o addr show dev " + nic + " 2>/dev/null";
+    auto * fp = popen(cmd.c_str(), "r");
+    if (fp == nullptr)
+    {
+        return {};
+    }
+    char line[512];
+    std::string cidr;
+    if (fgets(line, sizeof(line), fp) != nullptr)
+    {
+        std::istringstream ss{std::string(line)};
+        std::string index_colon;
+        std::string device;
+        std::string family;
+        ss >> index_colon >> device >> family >> cidr;
+        if (family != "inet")
+        {
+            cidr.clear();
+        }
+    }
+    pclose(fp);
+    return cidr;
+}
+
+/// 检查相机网段 vs 主机网卡; 不同段时提供 sudo 自动修复。
+/// 返回: true = 网段已就绪(原本就绪或修复成功)。
+bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
+                        bool check_only, int * failures)
+{
+    if (cams.empty())
+    {
+        return false;
+    }
+    const auto nics = list_host_ipv4();
+    std::vector<std::string> need_subnets;   // 相机需要但主机没有的网段
+    for (const auto & d : cams)
+    {
+        if (d.ip.empty())
+        {
+            continue;
+        }
+        const std::string sub = cam_subnet(d.ip);
+        bool covered = false;
+        for (const auto & n : nics)
+        {
+            if (cam_subnet(n.first) == sub)
+            {
+                covered = true;
+            }
+        }
+        if (!covered)
+        {
+            need_subnets.push_back(sub);
+        }
+    }
+    // 非相机网卡（Wi-Fi、VPN、Docker 等）无需也绝不能被删除地址。
+    // 相机 SDK 能通过具备同段地址的网卡正确收流；其它接口无关。
+    if (need_subnets.empty())
+    {
+        // 已同网段也不能跳过网卡突发容量检查；这正是“能枚举、预览却
+        // NO FRAME/残帧”的常见根因。选出实际覆盖相机网段的接口。
+        std::string camera_nic;
+        for (const auto & d : cams)
+        {
+            for (const auto & n : nics)
+            {
+                if (cam_subnet(d.ip) == cam_subnet(n.first))
+                {
+                    camera_nic = n.second;
+                    break;
+                }
+            }
+            if (!camera_nic.empty())
+            {
+                break;
+            }
+        }
+        const int ring = camera_nic.empty() ? -1 : current_rx_ring(camera_nic);
+        const std::string primary = camera_nic.empty() ? "" :
+            primary_ipv4_cidr(camera_nic);
+        const std::string wanted_subnet = cams.empty() ? "" :
+            cam_subnet(cams.front().ip);
+        const size_t slash = primary.find('/');
+        const std::string primary_ip = slash == std::string::npos ? "" :
+            primary.substr(0, slash);
+        // 不删除其它网卡的地址；只有用户明确选中的相机交换机接口上，
+        // 且首地址不属于相机网段时才提示删除这一个陈旧地址。
+        if (!primary.empty() && cam_subnet(primary_ip) != wanted_subnet)
+        {
+            std::cout << "  [诊断] 相机网卡 " << camera_nic << " 的首地址 "
+                      << primary << " 不在相机网段；Galaxy SDK 会因此 open "
+                      << "超时(-14)" << std::endl;
+            if (check_only)
+            {
+                ++(*failures);
+                return false;
+            }
+            if (!ask_yes("  是否只删除该相机网卡上的陈旧首地址 " + primary + "?", true) ||
+                std::system("sudo -v") != 0)
+            {
+                ++(*failures);
+                return false;
+            }
+            const std::string remove_cmd =
+                "sudo ip addr del " + primary + " dev " + camera_nic;
+            if (std::system(remove_cmd.c_str()) != 0)
+            {
+                std::cout << "  [错误] 未能删除陈旧地址，未继续绑定" << std::endl;
+                ++(*failures);
+                return false;
+            }
+            std::cout << "  [已修复] 已删除相机网卡陈旧首地址 " << primary
+                      << std::endl;
+        }
+        if (ring >= 0 && ring < 512)
+        {
+            std::cout << "  [诊断] 相机网卡 " << camera_nic << " 的 RX ring="
+                      << ring << "；5MP GigE 一帧约 615 个 UDP 包，"
+                      << "此值会造成残帧" << std::endl;
+            if (check_only)
+            {
+                ++(*failures);
+                return false;
+            }
+            if (ask_yes("  是否自动把该网卡设为 MTU 9000、RX ring 4096?", true))
+            {
+                if (std::system("sudo -v") != 0 ||
+                    !configure_gige_nic(camera_nic))
+                {
+                    ++(*failures);
+                    return false;
+                }
+            }
+            else
+            {
+                ++(*failures);
+                return false;
+            }
+        }
+        const fs::path service_path = fs::path("/etc/systemd/system") /
+            ("jbgs-gige-" + camera_nic + ".service");
+        if (!check_only && !camera_nic.empty() && !fs::exists(service_path))
+        {
+            if (std::system("sudo -v") != 0 ||
+                !install_gige_recovery_service(camera_nic, wanted_subnet))
+            {
+                ++(*failures);
+                return false;
+            }
+        }
+        return true;
+    }
+    std::cout << "  [诊断] 相机网段与本机网卡配置不匹配 "
+                 "(枚举可跨段, 但 open 会超时 -14):" << std::endl;
+    for (const auto & sub : need_subnets)
+    {
+        std::cout << "    - 相机网段 " << sub << ".x 未被任何网卡覆盖"
+                  << std::endl;
+    }
+    if (check_only)
+    {
+        std::cout << "    修复: 仅给连接相机交换机的网卡添加 "
+                     "<相机网段>.1/16（不要删除其他网卡地址）" << std::endl;
+        ++(*failures);
+        return false;
+    }
+    if (!ask_yes("  是否自动修复(需要 sudo 密码)?", true))
+    {
+        std::cout << "  [提示] 手动修复命令:" << std::endl;
+        for (const auto & sub : need_subnets)
+        {
+            std::cout << "      sudo ip addr add " << sub
+                      << ".1/16 dev <连接相机交换机的网卡>" << std::endl;
+        }
+        ++(*failures);
+        return false;
+    }
+    const std::string nic = ask("  输入连接相机交换机的网卡名: ");
+    if (nic.empty() || nic.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+            != std::string::npos)
+    {
+        std::cout << "  [错误] 网卡名不合法，未执行任何系统网络修改" << std::endl;
+        ++(*failures);
+        return false;
+    }
+    // 让 sudo 自己从控制终端读取密码。密码绝不进入本进程内存，也绝不
+    // 拼接到 shell 命令中，避免泄露与命令注入。
+    if (std::system("sudo -v") != 0)
+    {
+        std::cout << "  [错误] sudo 授权失败，未修改网络配置" << std::endl;
+        ++(*failures);
+        return false;
+    }
+    // 仅在用户刚指定为“相机交换机”的接口上处理旧主地址。Galaxy SDK
+    // 会把首地址作为控制通道源地址；若保留 192.168.x.x 一类旧地址，即使
+    // 随后添加了 169.254.x.x，仍可能 open 超时(-14)。
+    const std::string old_primary = primary_ipv4_cidr(nic);
+    const size_t old_slash = old_primary.find('/');
+    const std::string old_ip = old_slash == std::string::npos ? "" :
+        old_primary.substr(0, old_slash);
+    if (!old_primary.empty() && !need_subnets.empty() &&
+        cam_subnet(old_ip) != need_subnets.front())
+    {
+        if (!ask_yes("  该相机网卡首地址 " + old_primary +
+                     " 不属于相机网段，是否删除它?", true))
+        {
+            ++(*failures);
+            return false;
+        }
+        const std::string remove_cmd =
+            "sudo ip addr del " + old_primary + " dev " + nic;
+        if (std::system(remove_cmd.c_str()) != 0)
+        {
+            std::cout << "  [错误] 未能删除陈旧首地址，停止自动修复" << std::endl;
+            ++(*failures);
+            return false;
+        }
+        std::cout << "  [已修复] 已删除陈旧首地址 " << old_primary << std::endl;
+    }
+    bool ok = true;
+    for (const auto & sub : need_subnets)
+    {
+        const std::string cmd =
+            "sudo ip addr add " + sub + ".1/16 dev " + nic +
+            " 2>&1 | tail -1";
+        if (std::system(cmd.c_str()) != 0)
+        {
+            ok = false;
+        }
+        else
+        {
+            std::cout << "  [已修复] " << sub << ".1/16 已加入网卡"
+                      << std::endl;
+            ok = configure_gige_nic(nic) && ok;
+            ok = install_gige_recovery_service(nic, sub) && ok;
+        }
+    }
+    return ok;
+}
+
+// ----------------------------------------------------------------------
 // 预览
 // ----------------------------------------------------------------------
 
 /// 大恒预览: 打开指定序列号相机, 全屏显示直到按 ENTER
-void preview_daheng(const std::string & sn)
+bool preview_daheng(const std::string & sn)
 {
     // 库生命周期配对: 第 1 步枚举后已 closeLibrary(), 预览前必须重新
     // init(GalaxyDevice::open 不会自动初始化库, 否则 GXUpdateAllDeviceList
@@ -361,7 +762,7 @@ void preview_daheng(const std::string & sn)
     if (!GalaxyDevice::initLibrary())
     {
         std::cout << "  [错误] Galaxy SDK 初始化失败, 无法预览" << std::endl;
-        return;
+        return false;
     }
     GalaxyDevice dev;
     DeviceAddress addr;
@@ -375,7 +776,22 @@ void preview_daheng(const std::string & sn)
                      "(sudo ip addr add 169.254.x.x/16 dev <网卡>)"
                      "或用 GalaxyIPConfig 改相机 IP" << std::endl;
         GalaxyDevice::closeLibrary();
-        return;
+        return false;
+    }
+    // 相机的 TriggerMode 是设备侧持久属性：若上次运行节点时启用了软
+    // 触发，单独打开预览却不发 TriggerSoftware 就会一直显示 "NO FRAME"。
+    // 向导预览必须自包含，明确切回连续采集并在开流前设定巨帧包长。
+    if (!dev.setEnum(GX_ENUM_TRIGGER_MODE, GX_TRIGGER_MODE_OFF))
+    {
+        std::cout << "  [错误] 无法关闭软触发模式，预览不能保证出帧" << std::endl;
+        dev.close();
+        GalaxyDevice::closeLibrary();
+        return false;
+    }
+    if (!dev.setInt(GX_INT_GEV_PACKETSIZE, 8192))
+    {
+        std::cout << "  [提示] 未能设置 8192 字节巨帧包；将使用相机协商值"
+                  << std::endl;
     }
     int64_t payload = 0;
     if (!dev.getInt(GX_INT_PAYLOAD_SIZE, &payload) || payload <= 0)
@@ -388,7 +804,9 @@ void preview_daheng(const std::string & sn)
     if (!dev.startAcquisition())
     {
         std::cout << "  [错误] 相机 " << sn << " 无法开始采集" << std::endl;
-        return;
+        dev.close();
+        GalaxyDevice::closeLibrary();
+        return false;
     }
     const std::string win =
         "preview - SN " + sn + "  (press ENTER to finish)";
@@ -396,12 +814,16 @@ void preview_daheng(const std::string & sn)
     cv::setWindowProperty(win, cv::WND_PROP_FULLSCREEN, cv::WINDOW_FULLSCREEN);
     std::cout << "  预览中: SN " << sn << "。目视判断画面朝向, "
               << "然后在预览窗口按 ENTER 关闭..." << std::endl;
+    int ok_frames = 0;
+    auto fps_t0 = std::chrono::steady_clock::now();
+    bool accepted = false;
     while (true)
     {
         cv::Mat bgr;
         const GX_STATUS st = dev.grab(&frame, 500);
         if (st == GX_STATUS_SUCCESS && frame.nStatus == GX_FRAME_STATUS_SUCCESS)
         {
+            ++ok_frames;
             DX_PIXEL_COLOR_FILTER bayer = BAYERGR;
             bool bayer_ok = false;
             switch (frame.nPixelFormat)
@@ -429,24 +851,103 @@ void preview_daheng(const std::string & sn)
                 }
             }
         }
+        const double fps_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - fps_t0).count();
+        char fps_txt[64];
+        std::snprintf(fps_txt, sizeof(fps_txt), "%.1f fps",
+            fps_elapsed > 0.5 ? ok_frames / fps_elapsed : 0.0);
         if (bgr.empty())
         {
             bgr = cv::Mat(960, 1280, CV_8UC3, cv::Scalar(30, 30, 30));
-            cv::putText(bgr, "no frame from SN " + sn, cv::Point(40, 480),
+            cv::putText(bgr, "NO FRAME from SN " + sn, cv::Point(40, 480),
                         cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(0, 0, 255), 2);
         }
-        cv::putText(bgr, "SN " + sn + "  |  press ENTER", cv::Point(30, 70),
-                    cv::FONT_HERSHEY_SIMPLEX, 1.4, cv::Scalar(0, 255, 255), 2);
+        const std::string head = "SN " + sn + "  " + fps_txt +
+            (ok_frames >= 5 ? "  |  press ENTER to bind"
+                            : "  |  no/low frames - ENTER disabled (ESC=skip)");
+        cv::putText(bgr, head, cv::Point(30, 70),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.1,
+                    ok_frames >= 5 ? cv::Scalar(0, 255, 255)
+                                   : cv::Scalar(0, 0, 255), 2);
         cv::imshow(win, bgr);
-        if (cv::waitKey(30) == 13)   // ENTER
+        const int key = cv::waitKey(30);
+        // 帧数不足 5 帧时 ENTER 无效: 防止把无流相机绑进配置。
+        // ESC = 明确放弃该相机(跳过绑定)。
+        if (key == 27)
         {
+            std::cout << "  [跳过] SN " << sn << " 预览异常(帧数 "
+                      << ok_frames << ")已跳过绑定" << std::endl;
             break;
+        }
+        if (key == 13)
+        {
+            if (ok_frames >= 5)
+            {
+                accepted = true;
+                break;
+            }
+            std::cout << "  [拦截] 该相机 " << fps_txt
+                      << " 帧率异常, ENTER 已禁用; 检查链路后按 ESC 跳过"
+                      << std::endl;
         }
     }
     cv::destroyWindow(win);
     dev.stopAcquisition();
     dev.close();
     GalaxyDevice::closeLibrary();
+    return accepted;
+}
+
+/// 无 GUI 的真取流验收。枚举成功不代表 GVCP/GVSP 都可用：错误源地址、
+/// MTU 或 UDP 突发时常表现为“能找到相机但 NO FRAME”。
+bool probe_daheng(const std::string & sn)
+{
+    if (!GalaxyDevice::initLibrary())
+    {
+        return false;
+    }
+    GalaxyDevice dev;
+    DeviceAddress address;
+    address.serial_number = sn;
+    std::string error;
+    if (!dev.open(address, &error))
+    {
+        std::cout << "  [失败] SN " << sn << " 无法打开: " << error << std::endl;
+        GalaxyDevice::closeLibrary();
+        return false;
+    }
+    dev.setInt(GX_INT_GEV_PACKETSIZE, 8192);
+    dev.setInt(GX_INT_GEV_PACKETDELAY, 6000);
+    dev.setEnum(GX_ENUM_TRIGGER_MODE, GX_TRIGGER_MODE_OFF);
+    int64_t payload = 0;
+    const bool payload_ok = dev.getInt(GX_INT_PAYLOAD_SIZE, &payload) && payload > 0;
+    std::vector<uint8_t> buffer(static_cast<size_t>(payload_ok ? payload : 1));
+    GX_FRAME_DATA frame{};
+    frame.pImgBuf = buffer.data();
+    size_t complete = 0;
+    size_t incomplete = 0;
+    if (payload_ok && dev.startAcquisition())
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const GX_STATUS status = dev.grab(&frame, 400);
+            if (status == GX_STATUS_SUCCESS && frame.nStatus == GX_FRAME_STATUS_SUCCESS)
+            {
+                ++complete;
+            }
+            else if (status == GX_STATUS_SUCCESS)
+            {
+                ++incomplete;
+            }
+        }
+    }
+    dev.stopAcquisition();
+    dev.close();
+    GalaxyDevice::closeLibrary();
+    std::cout << "  [取流] SN " << sn << ": 完整帧=" << complete
+              << " 残帧=" << incomplete << std::endl;
+    return complete >= 3 && incomplete == 0;
 }
 
 /// 红外(V4L2)预览: 返回 true = 用户确认画面是热像且正常
@@ -459,35 +960,35 @@ bool preview_ir(const std::string & path)
     }
     cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, 512);
-    const std::string win = "preview - IR " + path + "  (y=OK n=next)";
+    const std::string win = "preview - IR " + path;
     cv::namedWindow(win, cv::WINDOW_NORMAL);
-    std::cout << "  预览中: " << path << "。画面是热像且正常 => 按 y 确认; "
-              << "否则按 n 换下一个候选..." << std::endl;
-    while (true)
+    cv::Mat frame;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline)
     {
-        cv::Mat frame;
         if (cap.read(frame) && !frame.empty())
         {
-            cv::putText(frame, path + "  |  y=OK  n=next",
+            cv::putText(frame, path + "  |  answer in terminal",
                         cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.9,
                         cv::Scalar(0, 255, 255), 2);
             cv::imshow(win, frame);
-        }
-        const int key = cv::waitKey(30);
-        if (key == 'y' || key == 'Y')
-        {
+            cv::waitKey(1);
             break;
         }
-        if (key == 'n' || key == 'N' || key == 27)
-        {
-            cv::destroyWindow(win);
-            cap.release();
-            return false;
-        }
     }
+    if (frame.empty())
+    {
+        std::cout << "  [错误] " << path << " 3 秒内没有可用画面" << std::endl;
+        cv::destroyWindow(win);
+        cap.release();
+        return false;
+    }
+    const std::string answer = ask(
+        "  请查看预览窗口；热像且正常吗? [Y=确认 / n=下一个]: ");
     cv::destroyWindow(win);
     cap.release();
-    return true;
+    return answer.empty() || answer == "Y" || answer == "y";
 }
 
 }  // namespace
@@ -541,6 +1042,93 @@ int main(int argc, char ** argv)
                   << " SN=" << d.serial_number << " IP=" << d.ip
                   << " MAC=" << d.mac << std::endl;
     }
+    // ---- 网段自动诊断与修复(必须在预览之前: 不同段时预览也打不开) ----
+    if (!ensure_gige_subnet(cams, check_only, &failures))
+    {
+        std::cout << "  [警告] 网段未就绪, 相机预览/绑定将不可用" << std::endl;
+    }
+
+    if (check_only && cams.size() >= 2 && failures == 0)
+    {
+        std::cout << "  实际取流验收(每台 3 秒，非仅枚举)..." << std::endl;
+        for (const auto & d : cams)
+        {
+            if (!probe_daheng(d.serial_number))
+            {
+                ++failures;
+            }
+        }
+    }
+
+    // 新机自举: 网卡没有任何 IPv4(或全为错段)时枚举必为空 ——
+    // 给网卡加 link-local 地址后重新枚举(相机出厂默认 169.254.x.x)。
+    if (cams.size() < 2 && !check_only)
+    {
+        if (ask_yes("  是否给某个网卡加 link-local 地址(169.254.10.10/16) "
+                    "后重新枚举?", false))
+        {
+            std::cout << "  本机网卡: " << std::endl;
+            if (auto * fp = popen("ip -o link show 2>/dev/null", "r"))
+            {
+                char line[512];
+                while (fgets(line, sizeof(line), fp) != nullptr)
+                {
+                    std::string l(line);
+                    if (l.find(" lo:") != std::string::npos)
+                    {
+                        continue;
+                    }
+                    // "2: enx0: <BROADCAST...>" => 取第二个冒号前的名字
+                    const size_t c1 = l.find(':');
+                    const size_t c2 = l.find(':', c1 + 1);
+                    if (c1 != std::string::npos && c2 != std::string::npos)
+                    {
+                        std::cout << "    " << l.substr(c1 + 2, c2 - c1 - 2)
+                                  << std::endl;
+                    }
+                }
+                pclose(fp);
+            }
+            const std::string nic = ask("  输入要使用的网卡名: ");
+            if (nic.empty() || nic.find_first_not_of(
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+                    != std::string::npos)
+            {
+                std::cout << "  [错误] 网卡名不合法，未执行网络修改" << std::endl;
+                ++failures;
+                return 1;
+            }
+            if (std::system("sudo -v") != 0)
+            {
+                std::cout << "  [错误] sudo 授权失败，未执行网络修改" << std::endl;
+                ++failures;
+                return 1;
+            }
+            const std::string cmd =
+                "sudo ip addr add 169.254.10.10/16 dev " + nic +
+                " 2>&1 | tail -1";
+            if (std::system(cmd.c_str()) == 0)
+            {
+                configure_gige_nic(nic);
+                std::cout << "  [已修复] 重新枚举..." << std::endl;
+                if (GalaxyDevice::initLibrary())
+                {
+                    cams = GalaxyDevice::listDevices(1500);
+                    GalaxyDevice::closeLibrary();
+                }
+                for (const auto & d : cams)
+                {
+                    std::cout << "  找到: [" << d.index << "] "
+                              << d.model_name << " SN=" << d.serial_number
+                              << " IP=" << d.ip << std::endl;
+                }
+            }
+            else
+            {
+                std::cout << "  [错误] 加地址失败, 检查网卡名" << std::endl;
+            }
+        }
+    }
     if (cams.size() < 2)
     {
         std::cout << "  [警告] 只找到 " << cams.size()
@@ -566,7 +1154,12 @@ int main(int argc, char ** argv)
                   << std::endl;
         for (const auto & d : cams)
         {
-            preview_daheng(d.serial_number);
+            if (!preview_daheng(d.serial_number))
+            {
+                std::cout << "  [跳过] SN " << d.serial_number
+                          << " 未通过预览，不参与左右绑定" << std::endl;
+                continue;
+            }
             while (true)
             {
                 const std::string a = ask(

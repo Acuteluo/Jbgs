@@ -47,10 +47,12 @@
 
         exposure_time: 5000.0    # 曝光时间, 单位 us, 可运行时在线修改
         gain: 1.0              # 增益, 可运行时在线修改
-        frame_rate: 20.0       # 双机目标采集帧率(Hz), 0 = 保持相机默认
+        # 单千兆上联下两台 5MP Bayer8 的安全目标值：8 Hz/台约 646 Mbps，
+        # 留出 GVSP/DDS 开销；20 Hz/台约 1.61 Gbps，必然导致残帧。
+        frame_rate: 8.0        # 双机目标采集帧率(Hz), 0 = 保持相机默认
         packet_size: 8192      # 主机 MTU=9000 时使用 8192，避免 9000B 包越过 MTU
         throughput_limit_bps: 55000000  # 每台 55MB/s；双机约 880Mbps，抑制突发拥塞
-        packet_delay: 0        # 默认关闭；固定 tick 值会因固件不同导致漏触发/帧率减半
+        packet_delay: -1       # 自动按相机 tick 限至约 42MB/s，老款 MER 双机共享 1GbE 的安全兜底
         # 每台相机唯一的话题: <camera_name>/image_raw/compressed(JPEG)
         publish_compressed: true
         jpeg_quality: 90
@@ -70,10 +72,10 @@
         camera_info_url: "package://galaxy_camera_dual/config/camera_info_right.yaml"
         exposure_time: 5000.0
         gain: 1.0
-        frame_rate: 20.0
+        frame_rate: 8.0
         packet_size: 8192
         throughput_limit_bps: 55000000
-        packet_delay: 0
+        packet_delay: -1
         publish_compressed: true
         jpeg_quality: 90
         publish_raw: false

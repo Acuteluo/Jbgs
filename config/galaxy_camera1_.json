@@ -20,9 +20,9 @@
 
   "exposure_time_us": 5000.0,
   "gain": 1.0,
-  "frame_rate_hz": 20.0,
+  "frame_rate_hz": 8.0,
   "packet_size": 8192,
   "throughput_limit_bps": 55000000,
-  "packet_delay": 0,
+  "packet_delay": -1,
   "jpeg_quality": 90
 }
