@@ -321,6 +321,11 @@ void CoreNode::InitParams()
     publish_annotated_ = declare_parameter("publish_annotated", true);
     annotated_quality_ =
         declare_parameter("annotated_jpeg_quality", 85);
+    // 导航协议可视化: 只订阅展示, 不干预协议
+    vision_cmd_topic_ = declare_parameter(
+        "vision_cmd_topic", "/vision_capture_cmd");
+    vision_status_topic_ = declare_parameter(
+        "vision_status_topic", "/vision_capture_status");
     ir_params_.enable_clahe = declare_parameter("ir.enable_clahe", false);
     ir_params_.clahe_clip = declare_parameter("ir.clahe_clip", 2.0);
 }
@@ -347,6 +352,21 @@ void CoreNode::InitROS2()
             create_publisher<sensor_msgs::msg::CompressedImage>(
                 "/core_node/right_annotated", ann_qos);
     }
+
+    // 导航协议可视化订阅(独立展示, 不影响巡检节点)
+    const auto nav_qos = rclcpp::QoS(
+        rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
+        rmw_qos_profile_sensor_data);
+    nav_cmd_sub_ = create_subscription<std_msgs::msg::UInt8>(
+        vision_cmd_topic_, nav_qos,
+        [this](std_msgs::msg::UInt8::SharedPtr m) {
+            nav_cmd_.store(m->data, std::memory_order_relaxed);
+        });
+    nav_status_sub_ = create_subscription<std_msgs::msg::UInt8>(
+        vision_status_topic_, nav_qos,
+        [this](std_msgs::msg::UInt8::SharedPtr m) {
+            nav_status_.store(m->data, std::memory_order_relaxed);
+        });
 
     left_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     right_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -947,6 +967,43 @@ void CoreNode::DrawSensorOverlay(cv::Mat & canvas)
                 cv::FONT_HERSHEY_SIMPLEX, 0.62, color, 1, cv::LINE_AA);
 }
 
+void CoreNode::DrawNavOverlay(cv::Mat & canvas)
+{
+    // 取协议快照(原子读)
+    const uint8_t cmd = nav_cmd_.load(std::memory_order_relaxed);
+    const uint8_t st = nav_status_.load(std::memory_order_relaxed);
+
+    // 状态词(in-image 只用 ASCII): WAIT=等待指令, CAP=取图中,
+    // DONE=取图完成, ACK?=等待导航确认(0x02 已发、导航未回 0x00)
+    const char * state = "WAIT CMD";
+    cv::Scalar color(120, 255, 120);          // 绿
+    if (st == 0x02)
+    {
+        state = "DONE (wait nav 0x00)";
+        color = cv::Scalar(120, 200, 255);    // 橙: 等待导航确认
+    }
+    else if (st == 0x01 || cmd == 0x01)
+    {
+        state = "CAPTURING";
+        color = cv::Scalar(60, 220, 220);     // 黄: 取图中
+    }
+
+    // 半透明黑底(位置: 传感器块下方, 同宽, 不遮挡)
+    const cv::Rect bg(6, 160, 560, 64);
+    cv::Mat roi = canvas(bg);
+    cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
+    cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
+    cv::rectangle(canvas, bg, color, 1, cv::LINE_AA);
+
+    char l1[96];
+    std::snprintf(l1, sizeof(l1),
+        "NAV->VIS 0x%02X   VIS->NAV 0x%02X", cmd, st);
+    cv::putText(canvas, l1, cv::Point(14, 186),
+                cv::FONT_HERSHEY_SIMPLEX, 0.62, color, 1, cv::LINE_AA);
+    cv::putText(canvas, state, cv::Point(14, 214),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv::LINE_AA);
+}
+
 // ============================== 同屏显示线程 ==============================
 
 void CoreNode::DisplayLoop()
@@ -1065,8 +1122,9 @@ void CoreNode::DisplayLoop()
                 }
             }
 
-            // ---- 传感器数据标注: 总图左上角 ----
+            // ---- 传感器数据标注 + 导航协议状态(总图左上区域) ----
             DrawSensorOverlay(canvas);
+            DrawNavOverlay(canvas);
 
             // ---- 总图右下角: 显示帧率 ----
             const std::string fps_text =

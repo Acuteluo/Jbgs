@@ -39,6 +39,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/u_int8.hpp>
 
 #include <opencv2/core.hpp>
 
@@ -152,6 +153,8 @@ private:
 
     /// 传感器数据标注块(画在总图左上角, 半透明底 + 两行 ASCII 文本)。
     void DrawSensorOverlay(cv::Mat & canvas);
+    /// 导航协议标注块: 实时显示收到的指令/发出的状态/对应状态词。
+    void DrawNavOverlay(cv::Mat & canvas);
 
     /// 窗格顶部信息条(标题 + 帧率 + 检测摘要)。
     void DrawPaneHeader(cv::Mat & pane_img, const std::string & title,
@@ -201,6 +204,14 @@ private:
     double display_fps_ = 30.0;        ///< 显示刷新率上限(Hz)
     double stale_timeout_sec_ = 3.0;   ///< 超过该时长无新帧判定该路离线
     bool show_img_ = true;             ///< 是否弹出同屏显示窗口
+
+    // ---- 导航协议可视化(仅订阅展示, 不干预协议) ----
+    std::string vision_cmd_topic_ = "/vision_capture_cmd";
+    std::string vision_status_topic_ = "/vision_capture_status";
+    std::atomic<uint8_t> nav_cmd_{0};      ///< 最近收到的导航指令字节
+    std::atomic<uint8_t> nav_status_{0};   ///< 最近发出的状态字节(订阅同话题)
+    rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr nav_cmd_sub_;
+    rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr nav_status_sub_;
 
     // ---- 标注图发布(巡检保存"模型处理完框出来的图"用) ----
     bool publish_annotated_ = true;   ///< 是否发布标注图话题
