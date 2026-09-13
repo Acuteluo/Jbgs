@@ -317,6 +317,10 @@ void CoreNode::InitParams()
     ir_params_.temporal_window = declare_parameter("ir.temporal_window", 5);
     ir_params_.temporal_min_hits =
         declare_parameter("ir.temporal_min_hits", 3);
+    // 标注图发布: 巡检保存用的是"模型处理完画框后的帧"
+    publish_annotated_ = declare_parameter("publish_annotated", true);
+    annotated_quality_ =
+        declare_parameter("annotated_jpeg_quality", 85);
     ir_params_.enable_clahe = declare_parameter("ir.enable_clahe", false);
     ir_params_.clahe_clip = declare_parameter("ir.clahe_clip", 2.0);
 }
@@ -330,6 +334,20 @@ void CoreNode::InitROS2()
 
     // 三路图像订阅各自独立回调组 => 三路 JPEG 解码并发执行,
     // 一路卡顿(大图解码/坏帧)不会排队阻塞其他路(多线程要点)。
+    // 标注图发布器(模型处理完画框后的帧; 巡检协议保存用)
+    if (publish_annotated_)
+    {
+        const auto ann_qos = rclcpp::QoS(
+            rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
+            rmw_qos_profile_sensor_data);
+        left_annotated_pub_ =
+            create_publisher<sensor_msgs::msg::CompressedImage>(
+                "/core_node/left_annotated", ann_qos);
+        right_annotated_pub_ =
+            create_publisher<sensor_msgs::msg::CompressedImage>(
+                "/core_node/right_annotated", ann_qos);
+    }
+
     left_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     right_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     ir_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -646,6 +664,29 @@ void CoreNode::VisibleDetectLoop(
                            stream.src_fps.load(std::memory_order_relaxed),
                            fps, n_cracks, infer_ms);
             DrawPaneHeader(pane_img, stream.title, info);
+
+            // 5.5) 发布标注图(模型处理完画框后的帧), 供巡检协议保存;
+            //      JPEG 编码在本检测线程内完成, 与显示/采集互不阻塞。
+            if (publish_annotated_ && !pane_img.empty())
+            {
+                auto & ann_pub = (&stream == &left_) ? left_annotated_pub_
+                                                     : right_annotated_pub_;
+                if (ann_pub)
+                {
+                    std::vector<uint8_t> buf;
+                    std::vector<int> qp = {cv::IMWRITE_JPEG_QUALITY,
+                                           annotated_quality_};
+                    if (cv::imencode(".jpg", pane_img, buf, qp))
+                    {
+                        sensor_msgs::msg::CompressedImage msg;
+                        msg.header.stamp = stream.latest_stamp;
+                        msg.header.frame_id = stream.name;
+                        msg.format = "jpeg";
+                        msg.data = std::move(buf);
+                        ann_pub->publish(msg);
+                    }
+                }
+            }
 
             // 6) 交给显示线程(锁内 swap, 只保留最新)
             SubmitPane(pane, pane_img, last_seq);

@@ -97,8 +97,14 @@ InspectionNode::InspectionNode()
 {
     // ---- 参数(可在 launch.json / launch 参数中覆盖) ----
     in_trulyworking_ = declare_parameter("in_trulyworking", false);
-    input_topic_ = declare_parameter("input_topic", "/inspection/command");
-    ack_topic_ = declare_parameter("ack_topic", "/inspection/ack");
+    input_topic_ = declare_parameter("input_topic", "/vision_capture_cmd");
+    ack_topic_ = declare_parameter("ack_topic", "/vision_capture_status");
+    status_rate_hz_ = declare_parameter("status_rate_hz", 20.0);
+    annot_gap_ms_ = declare_parameter("annot_gap_ms", 500.0);
+    left_annotated_topic_ = declare_parameter(
+        "left_annotated_topic", "/core_node/left_annotated");
+    right_annotated_topic_ = declare_parameter(
+        "right_annotated_topic", "/core_node/right_annotated");
     const double frame_timeout =
         declare_parameter("frame_timeout_sec", 3.0);
     const int target_index = declare_parameter("target_frame_index", 2);
@@ -134,6 +140,9 @@ InspectionNode::InspectionNode()
     p.target_frame_index = target_index;
     p.frame_timeout_sec = frame_timeout;
     p.save_dir = save_dir;
+    p.annot_gap_ms = annot_gap_ms_;
+    p.raw_subdir = "raw";            // 原图子目录
+    p.annotated_subdir = "annotated";  // 标注图子目录
 
     auto lg = get_logger();
     fsm_ = std::make_unique<InspectionFsm>(
@@ -147,9 +156,8 @@ InspectionNode::InspectionNode()
             return std::filesystem::remove(path, ec);
         },
         [this]() {
-            std_msgs::msg::UInt8 ack;
-            ack.data = 0x02;
-            ack_pub_->publish(ack);
+            // 0x02 由协议状态定时器发出(done_await_zero 期间字节=0x02)
+            done_await_zero_ = true;
         },
         []() { return std::chrono::steady_clock::now(); },
         []() {
@@ -203,12 +211,34 @@ InspectionNode::InspectionNode()
         [this](std_msgs::msg::UInt8::SharedPtr msg) { CommandCallback(msg); },
         opt_cmd);
 
-    ack_pub_ = create_publisher<std_msgs::msg::UInt8>(ack_topic_, rclcpp::QoS(10));
-    status_pub_ = create_publisher<std_msgs::msg::String>("~/status", rclcpp::QoS(10));
+    // 协议状态话题: 0x00 空闲 / 0x01 保存中 / 0x02 拍完(即协议里的"回传")
+    status_pub_ = create_publisher<std_msgs::msg::UInt8>(ack_topic_, rclcpp::QoS(10));
+    status_str_pub_ = create_publisher<std_msgs::msg::String>(
+        "~/status", rclcpp::QoS(10));
 
-    // 看门狗: 10Hz 超时检查 + 状态发布(供面板/测试观测)。
+    // 协议状态定时发布(可调频率)
+    const auto status_period = std::chrono::milliseconds(
+        static_cast<int64_t>(1000.0 / std::max(status_rate_hz_, 1.0)));
+    status_timer_ = create_wall_timer(
+        status_period, [this]() { StatusTimer(); });
+
+    // 看门狗: 10Hz 超时检查 + 调试状态发布。
     watchdog_timer_ = create_wall_timer(
         std::chrono::milliseconds(100), [this]() { WatchdogTimer(); });
+
+    // 标注图订阅(culvert_core 发布, 时间戳与原图配对)
+    left_ann_sub_ = create_subscription<sensor_msgs::msg::CompressedImage>(
+        left_annotated_topic_, qos,
+        [this](sensor_msgs::msg::CompressedImage::SharedPtr msg) {
+            AnnotatedCallback(fsm_->left(), std::move(msg));
+        },
+        opt_left);
+    right_ann_sub_ = create_subscription<sensor_msgs::msg::CompressedImage>(
+        right_annotated_topic_, qos,
+        [this](sensor_msgs::msg::CompressedImage::SharedPtr msg) {
+            AnnotatedCallback(fsm_->right(), std::move(msg));
+        },
+        opt_right);
 
     // 保存目录提前建好(写盘阶段还会再校验并报错)。
     std::error_code ec;
@@ -224,6 +254,21 @@ void InspectionNode::CommandCallback(const std_msgs::msg::UInt8::SharedPtr msg)
         RCLCPP_WARN_THROTTLE(
             get_logger(), *this, 5000,
             "收到未知巡检指令 0x%02X(仅支持 0x01), 忽略", msg->data);
+        return;
+    }
+
+    last_cmd_level_.store(msg->data, std::memory_order_relaxed);
+    // 导航回 0x00 = 上一站流程结束, 解除门控(之后的 0x01 才是新周期)
+    if (msg->data == 0x00)
+    {
+        done_await_zero_ = false;
+    }
+    // 完成后残留的 0x01(导航尚未切回 0x00)必须忽略, 防止误触发下一站
+    if (done_await_zero_)
+    {
+        RCLCPP_WARN_THROTTLE(
+            get_logger(), *this, 2000,
+            "已完成等待导航回 0x00, 忽略残留 0x01");
         return;
     }
 
@@ -263,7 +308,7 @@ void InspectionNode::ImageCallback(
 void InspectionNode::WatchdogTimer()
 {
     // 状态发布(有订阅者才发, 空载零流量)。
-    if (status_pub_ && status_pub_->get_subscription_count() > 0)
+    if (status_str_pub_ && status_str_pub_->get_subscription_count() > 0)
     {
         std_msgs::msg::String st;
         char buf[160];
@@ -276,11 +321,52 @@ void InspectionNode::WatchdogTimer()
                       static_cast<unsigned long>(
                           fsm_->right().arrived.load(std::memory_order_relaxed)));
         st.data = buf;
-        status_pub_->publish(st);
+        status_str_pub_->publish(st);
     }
 
     std::lock_guard<std::mutex> lock(state_mutex_);
     fsm_->checkTimeout();
+}
+
+// ============================== 协议状态发布 ==============================
+
+void InspectionNode::StatusTimer()
+{
+    if (!status_pub_)
+    {
+        return;   // 非巡检模式
+    }
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    uint8_t byte = 0x00;
+    if (done_await_zero_)
+    {
+        byte = 0x02;   // 已完成, 等导航回 0x00
+    }
+    else if (fsm_->state() != FsmState::kIdle)
+    {
+        byte = 0x01;   // 正在等待/保存图片
+    }
+    std_msgs::msg::UInt8 msg;
+    msg.data = byte;
+    status_pub_->publish(msg);
+}
+
+// ============================== 标注图回调 ==============================
+
+void InspectionNode::AnnotatedCallback(
+    InspectionFsm::Side & side,
+    sensor_msgs::msg::CompressedImage::SharedPtr msg)
+{
+    if (fsm_->state() != FsmState::kArmed)
+    {
+        return;   // 只在等待保存期间配对
+    }
+    InspectionFrame frame;
+    frame.data = msg->data.data();
+    frame.size = msg->data.size();
+    frame.stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    fsm_->onAnnotatedFrame(side, frame);
 }
 
 InspectionNode::~InspectionNode() = default;

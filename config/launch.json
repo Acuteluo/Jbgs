@@ -1,33 +1,61 @@
 {
   "_说明": "总启动配置: run.sh 启动 bringup/all.launch.py 时读取。键含义见 README。相对路径以工程根目录(run.sh 所在目录)为基准。launch 参数(sim:= 等)优先级高于本文件。",
-
+  "_键说明": {
+    "show_windows": "是否弹出同屏大面板(左/右大恒检测叠加 + 红外叠加 + 传感器数据); 无图形环境自动强制关闭",
+    "fullscreen": "面板全屏展示: 窗口无边框占满整屏, 窗格高度按屏幕宽高比自动计算",
+    "in_trulyworking": "巡检模式总开关: false 时巡检节点不订阅 0x01、不保存巡检图片",
+    "sim_mode": "true=模拟模式(无真机, 相机/传感器由模拟设备出图, 支持热插拔时间窗); false=真机模式",
+    "log_level": "ROS 日志级别: debug / info / warn / error",
+    "save_dir": "巡检图片保存目录(相对工程根)",
+    "input_topic": "导航->视觉指令话题(std_msgs/UInt8, 20Hz reliable; 0x00 空闲, 0x01 触发保存)",
+    "ack_topic": "视觉->导航状态话题(std_msgs/UInt8, 20Hz reliable; 0x00 空闲, 0x01 保存中, 0x02 拍完)",
+    "frame_timeout_sec": "巡检等待目标帧的超时秒数(自最近一次成功捕获起算)",
+    "target_frame_index": "取触发后按到达顺序的第 N 帧(t 时刻视为第 0 帧)",
+    "enable_yolo": "左右大恒 YOLO 裂缝检测开关(左右共用同一配置)",
+    "enable_ir_seepage": "红外渗水检测开关(时间一致性滑窗)",
+    "enable_sensor": "是否启动塔石传感器驱动节点",
+    "camera_config_files": "左/右大恒与红外相机的设备定义 JSON 路径(SN 绑定/别名/内参占位等)",
+    "sim.galaxy": "双大恒模拟热插拔时间窗: initial_absent_sec=开机后离线秒数, disconnect_at_sec=断连开始时刻, disconnect_duration_sec=断连时长(0=不断连)",
+    "sim.infrared": "红外模拟热插拔时间窗(同上)",
+    "sim.sensor": "传感器模拟热插拔时间窗(同上)",
+    "sim.sim_image_dir_left": "模拟模式左大恒轮播图片目录",
+    "sim.sim_image_dir_right": "模拟模式右大恒轮播图片目录"
+  },
   "show_windows": true,
   "fullscreen": true,
   "in_trulyworking": true,
   "sim_mode": false,
   "log_level": "info",
   "save_dir": "run_save",
-
-  "input_topic": "/inspection/command",
-  "ack_topic": "/inspection/ack",
+  "input_topic": "/vision_capture_cmd",
+  "ack_topic": "/vision_capture_status",
   "frame_timeout_sec": 3.0,
   "target_frame_index": 2,
-
   "enable_yolo": true,
   "enable_ir_seepage": true,
   "enable_sensor": true,
-
   "camera_config_files": {
     "left": "config/galaxy_camera_1.json",
     "right": "config/galaxy_camera_2.json",
     "infrared": "config/infrared_camera.json"
   },
-
   "sim": {
     "_说明": "热插拔模拟时间窗(仅 sim_mode=true 生效); 测试可用 launch 参数逐设备覆盖",
-    "galaxy": { "initial_absent_sec": 2.0, "disconnect_at_sec": 0.0, "disconnect_duration_sec": 4.0 },
-    "infrared": { "initial_absent_sec": 2.0, "disconnect_at_sec": 0.0, "disconnect_duration_sec": 4.0 },
-    "sensor": { "initial_absent_sec": 2.0, "disconnect_at_sec": 0.0, "disconnect_duration_sec": 4.0 },
+    "galaxy": {
+      "initial_absent_sec": 2.0,
+      "disconnect_at_sec": 0.0,
+      "disconnect_duration_sec": 4.0
+    },
+    "infrared": {
+      "initial_absent_sec": 2.0,
+      "disconnect_at_sec": 0.0,
+      "disconnect_duration_sec": 4.0
+    },
+    "sensor": {
+      "initial_absent_sec": 2.0,
+      "disconnect_at_sec": 0.0,
+      "disconnect_duration_sec": 4.0
+    },
     "sim_image_dir_left": "pictures/light",
     "sim_image_dir_right": "pictures/dark"
   }

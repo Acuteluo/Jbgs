@@ -1067,7 +1067,10 @@ int main(int argc, char ** argv)
         if (ask_yes("  是否给某个网卡加 link-local 地址(169.254.10.10/16) "
                     "后重新枚举?", false))
         {
-            std::cout << "  本机网卡: " << std::endl;
+            // 枚举候选网卡(排除 lo): 名字由 udev 规则生成
+            // (enx + USB 网卡 MAC), 每台机器不同, 故列出供选择;
+            // 只有一个候选时直接回车采用默认。
+            std::vector<std::string> candidates;
             if (auto * fp = popen("ip -o link show 2>/dev/null", "r"))
             {
                 char line[512];
@@ -1083,13 +1086,32 @@ int main(int argc, char ** argv)
                     const size_t c2 = l.find(':', c1 + 1);
                     if (c1 != std::string::npos && c2 != std::string::npos)
                     {
-                        std::cout << "    " << l.substr(c1 + 2, c2 - c1 - 2)
-                                  << std::endl;
+                        candidates.push_back(
+                            l.substr(c1 + 2, c2 - c1 - 2));
                     }
                 }
                 pclose(fp);
             }
-            const std::string nic = ask("  输入要使用的网卡名: ");
+            for (const auto & name : candidates)
+            {
+                std::cout << "    " << name << std::endl;
+            }
+            std::string nic;
+            if (candidates.size() == 1)
+            {
+                nic = candidates.front();
+                std::cout << "  只有一块候选网卡, 直接使用: " << nic
+                          << " (回车确认, 或输入其他网卡名)" << std::endl;
+                const std::string a = ask("  网卡名 [" + nic + "]: ");
+                if (!a.empty())
+                {
+                    nic = a;
+                }
+            }
+            else
+            {
+                nic = ask("  输入要使用的网卡名: ");
+            }
             if (nic.empty() || nic.find_first_not_of(
                     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
                     != std::string::npos)
@@ -1312,7 +1334,7 @@ int main(int argc, char ** argv)
         if (!left_sn.empty())
         {
             patch_json_string_value(
-                root + "/config/galaxy_camera1_.json", "serial_number",
+                root + "/config/galaxy_camera_1.json", "serial_number",
                 left_sn);
         }
         if (!right_sn.empty())
