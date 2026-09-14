@@ -1721,6 +1721,10 @@ bool apply_stream_settings(
 
 struct DualProbeResult
 {
+    // ready 只表示两台设备确实完成了打开、参数设置和开始采集。打开失败
+    // (例如别的程序占用相机、刚重插网卡尚未稳定)绝不能被误判成带宽不足，
+    // 更不能据此把已经验证过的帧率降下来。
+    bool ready = false;
     bool ok = false;
     size_t complete[2] = {0, 0};
     size_t incomplete[2] = {0, 0};
@@ -1778,6 +1782,7 @@ DualProbeResult probe_dual_stream(
             return out;
         }
     }
+    out.ready = true;
 
     std::atomic<bool> running{true};
     std::atomic<size_t> complete0{0};
@@ -1881,6 +1886,12 @@ DualProbeResult probe_dual_stream(
 
 void print_dual_probe(const DualProbeResult & r, double fps)
 {
+    if (!r.ready)
+    {
+        std::cout << "  [双机 " << fps
+                  << " fps] 未进入采集状态(不是带宽结论)" << std::endl;
+        return;
+    }
     std::cout << "  [双机 " << fps << " fps] 完整帧="
               << r.complete[0] << "/" << r.complete[1]
               << " 残帧=" << r.incomplete[0] << "/" << r.incomplete[1]
@@ -2117,6 +2128,7 @@ StreamTune find_max_stable_fps(
             cands = {12, 10, 8, 6, 4};
         }
     }
+    bool camera_access_failed = false;
     auto try_dual_cands = [&]() -> bool
     {
         for (const int fps_i : cands)
@@ -2126,10 +2138,37 @@ StreamTune find_max_stable_fps(
             std::cout << "  探测双机 " << fps_i << " fps (packet="
                       << tune.packet_size << ", 每台限速 "
                       << (tput / 1000000) << " MB/s)..." << std::endl;
-            const DualProbeResult r = probe_dual_stream(
+            DualProbeResult r = probe_dual_stream(
                 cams[0].serial_number, cams[1].serial_number, fps, tput, 3,
                 tune.packet_size);
             print_dual_probe(r, fps);
+            if (!r.ready)
+            {
+                camera_access_failed = true;
+                std::cout << "  [中止] 相机未能进入采集状态；保留现有 JSON "
+                             "配置，不把访问/占用故障误降为低帧率。"
+                          << std::endl;
+                return false;
+            }
+            // 首轮刚恢复采集时可能有少量触发周期尚未稳定。只在“确实已
+            // 进入采集但恰好未过线”时复测一次；两轮都失败才下调帧率。
+            if (!r.ok)
+            {
+                std::cout << "  [复测] " << fps_i
+                          << " fps 首轮未过线，重新验证一次..." << std::endl;
+                r = probe_dual_stream(
+                    cams[0].serial_number, cams[1].serial_number, fps, tput,
+                    3, tune.packet_size);
+                print_dual_probe(r, fps);
+                if (!r.ready)
+                {
+                    camera_access_failed = true;
+                    std::cout << "  [中止] 复测时相机未进入采集状态；保留"
+                                 "现有 JSON 配置。"
+                              << std::endl;
+                    return false;
+                }
+            }
             if (r.ok)
             {
                 tune.fps = fps;
@@ -2142,7 +2181,7 @@ StreamTune find_max_stable_fps(
         return false;
     };
     bool dual_ok = try_dual_cands();
-    if (!dual_ok && tune.packet_size > 1500)
+    if (!dual_ok && !camera_access_failed && tune.packet_size > 1500)
     {
         std::cout << "  [提示] 巨帧双机不稳定, 改试 GVSP 1500" << std::endl;
         tune.packet_size = 1500;
@@ -2528,14 +2567,42 @@ int main(int argc, char ** argv)
         }
         else
         {
-            const DualProbeResult r = probe_dual_stream(
+            DualProbeResult r = probe_dual_stream(
                 cams[0].serial_number, cams[1].serial_number,
                 json_fps,
                 json_tput > 0 ? json_tput : throughput_for_fps(json_fps, 2, usb),
                 3, recommended_packet_size(usb));
             GalaxyDevice::closeLibrary();
             print_dual_probe(r, json_fps);
-            if (!r.ok)
+            if (r.ready && !r.ok)
+            {
+                std::cout << "  [复测] 当前 JSON 帧率首轮未过线，重新验证一次..."
+                          << std::endl;
+                if (GalaxyDevice::initLibrary())
+                {
+                    r = probe_dual_stream(
+                        cams[0].serial_number, cams[1].serial_number,
+                        json_fps,
+                        json_tput > 0 ? json_tput :
+                        throughput_for_fps(json_fps, 2, usb),
+                        3, recommended_packet_size(usb));
+                    GalaxyDevice::closeLibrary();
+                    print_dual_probe(r, json_fps);
+                }
+                else
+                {
+                    r.ready = false;
+                }
+            }
+            if (!r.ready)
+            {
+                ++failures;
+                std::cout << "  [失败] 相机没有进入采集状态(可能被其他程序占用、"
+                             "刚重插仍在枚举，或控制通道异常)。保留当前 JSON，"
+                             "不会据此推荐降帧；排除占用后重跑 --check。"
+                          << std::endl;
+            }
+            else if (!r.ok)
             {
                 ++failures;
                 std::cout << "  [失败] 当前配置帧率在本链路上不稳定。"
