@@ -13,9 +13,10 @@
 //   4. 传感器确认: 对每个串口候选发 Modbus 读寄存器, 展示 ~6 秒实时
 //      温湿度/CO2, 确认正常 => 写入 sensor_driver.yaml 的 device_name;
 //   5. 双机同时取流测带宽, 自动写入两台 JSON 能稳定跑通的最高
-//      frame_rate_hz(以及配套 throughput_limit_bps)。扩展坞若落在
-//      USB2(480Mbps)上, 8fps 双 5MP 会打满总线, 必须降帧才能出图。
-//      红外/传感器仍可走扩展坞 USB, 仅交换机改插板载网口时要认板载口;
+//      frame_rate_hz(以及配套 throughput_limit_bps)。相机交换机若经
+//      USB2(480Mbps)接入，双 5MP GigE 不允许“降帧勉强写入”，必须换
+//      USB3+ 或把交换机直插板载网口。红外/传感器可继续走扩展坞 USB；
+//      向导按实际载波、USB 拓扑最低速率和双机完整帧实测决定配置。
 //   6. 全部通过后把 launch.json 的 sim_mode 置 false(真机模式),
 //      所有被修改的文件先备份为 *.bak。
 //
@@ -858,17 +859,18 @@ int nic_mtu(const std::string & nic)
     return v;
 }
 
-/// 读 USB 设备 speed(Mbps)。非 USB 网卡返回 0。
-/// RTL8153 的 ethtool 可能显示 1000Mb/s, 但挂在 USB2 根集线器上真实
-/// 上限只有 480Mbps —— 必须看 USB 拓扑, 不能看以太网协商。
-int nic_usb_speed_mbps(const std::string & nic)
+/// 沿 sysfs 设备链找到 USB 各级链路的最低速率(Mbps)。不能只读最靠近
+/// 设备的 speed：USB3 网卡若经 USB2 扩展坞上联，该值可能是 5000，
+/// 但真正瓶颈是父级的 480。非 USB 设备返回 0。
+int usb_path_min_speed_mbps(const fs::path & sysfs_device)
 {
     std::error_code ec;
-    fs::path p = fs::canonical("/sys/class/net/" + nic + "/device", ec);
+    fs::path p = fs::canonical(sysfs_device, ec);
     if (ec)
     {
         return 0;
     }
+    int minimum = 0;
     for (int i = 0; i < 8 && p != p.root_path(); ++i)
     {
         std::ifstream vendor(p / "idVendor");
@@ -876,12 +878,36 @@ int nic_usb_speed_mbps(const std::string & nic)
         if (vendor && speedf)
         {
             double sp = 0;
-            if (speedf >> sp)
+            if ((speedf >> sp) && sp > 0.0)
             {
-                return static_cast<int>(std::lround(sp));
+                const int mbps = static_cast<int>(std::lround(sp));
+                minimum = minimum == 0 ? mbps : std::min(minimum, mbps);
             }
         }
         p = p.parent_path();
+    }
+    return minimum;
+}
+
+/// 读相机网卡所在 USB 路径的实际瓶颈；板载/PCI 网卡返回 0。
+int nic_usb_speed_mbps(const std::string & nic)
+{
+    return usb_path_min_speed_mbps("/sys/class/net/" + nic + "/device");
+}
+
+/// /dev/video* 与 /dev/ttyUSB*/ttyACM* 也可能挂在扩展坞或板载 USB。
+/// 仅作拓扑报告：红外与 Modbus 本身带宽很小，不会据此拒绝设备。
+int devnode_usb_speed_mbps(const std::string & devnode)
+{
+    const std::string name = fs::path(devnode).filename().string();
+    if (name.rfind("video", 0) == 0)
+    {
+        return usb_path_min_speed_mbps(
+            "/sys/class/video4linux/" + name + "/device");
+    }
+    if (name.rfind("ttyUSB", 0) == 0 || name.rfind("ttyACM", 0) == 0)
+    {
+        return usb_path_min_speed_mbps("/sys/class/tty/" + name + "/device");
     }
     return 0;
 }
@@ -950,6 +976,36 @@ std::string link_kind_label(int usb_mbps)
         return "USB 网卡";
     }
     return "板载有线网口(交换机直插)";
+}
+
+std::string aux_usb_path_label(int usb_mbps)
+{
+    if (usb_mbps <= 0)
+    {
+        return "非 USB / 无法从 sysfs 识别";
+    }
+    if (usb_mbps <= 480)
+    {
+        return "USB 2.0 (480 Mbps；对红外/传感器通常足够)";
+    }
+    return "USB 3+ (" + std::to_string(usb_mbps) + " Mbps)";
+}
+
+/// 红外、传感器不参与 GigE 带宽拒绝，但把它们实际 USB 上联打印出来，
+/// 让“全接扩展坞”和“网线板载直插、USB 设备仍在坞上”两种拓扑一眼可见。
+void print_aux_usb_topology(const char * title,
+                            const std::vector<std::string> & devices)
+{
+    if (!devices.empty())
+    {
+        std::cout << "  " << title << " USB 拓扑:" << std::endl;
+    }
+    for (const auto & dev : devices)
+    {
+        const int speed = devnode_usb_speed_mbps(dev);
+        std::cout << "  候选: " << dev << "  ["
+                  << aux_usb_path_label(speed) << "]" << std::endl;
+    }
 }
 
 void print_link_identity(const std::string & nic)
@@ -1837,6 +1893,7 @@ struct StreamTune
     int64_t throughput_bps = 0;
     int64_t packet_size = 8192;
     int usb_mbps = 0;
+    int eth_mbps = -1;
     int mtu = 1500;
     int rx_ring = -1;
     std::string nic;
@@ -1847,6 +1904,10 @@ void print_stream_settings_summary(const StreamTune & tune)
     std::cout << "  -------- 实测后的相机上限 --------" << std::endl;
     std::cout << "  链路: " << (tune.nic.empty() ? "?" : tune.nic)
               << "  (" << link_kind_label(tune.usb_mbps) << ")" << std::endl;
+    if (tune.eth_mbps > 0)
+    {
+        std::cout << "  以太网协商: " << tune.eth_mbps << " Mb/s" << std::endl;
+    }
     if (tune.fps > 0.0)
     {
         std::cout << "  双机稳定帧率: " << tune.fps << " fps  (写入 JSON)"
@@ -1974,10 +2035,30 @@ StreamTune find_max_stable_fps(
         return tune;
     }
     tune.usb_mbps = camera_nic.empty() ? 0 : nic_usb_speed_mbps(camera_nic);
+    tune.eth_mbps = camera_nic.empty() ? -1 : nic_eth_speed_mbps(camera_nic);
     tune.packet_size = recommended_packet_size(tune.usb_mbps);
     tune.mtu = recommended_mtu(tune.usb_mbps);
     tune.rx_ring = camera_nic.empty() ? -1 : current_rx_ring(camera_nic);
     const bool usb2 = tune.usb_mbps > 0 && tune.usb_mbps <= 480;
+
+    // 双 5MP GigE 经 USB2 无论怎样限速都属于勉强运行：与红外、键鼠等
+    // 同坞设备共享总线时更容易残帧。此处硬拒绝，不探测低帧率、更不写 JSON。
+    if (usb2)
+    {
+        std::cout << "  [拒绝配置] 相机交换机网卡实际经 USB2 "
+                  << "(" << tune.usb_mbps << " Mbps) 上联；双 5MP GigE "
+                     "不允许写入降帧配置。" << std::endl;
+        print_link_upgrade_advice(camera_nic, tune.usb_mbps);
+        return tune;
+    }
+    // 交换机到主机若只协商到百兆，同样不能给双 5MP 写一个“看似能跑”的值。
+    if (tune.eth_mbps > 0 && tune.eth_mbps < 1000)
+    {
+        std::cout << "  [拒绝配置] " << camera_nic << " 仅协商到 "
+                  << tune.eth_mbps << " Mb/s；请检查网线/交换机端口，"
+                     "恢复千兆后再测。" << std::endl;
+        return tune;
+    }
 
     if (!GalaxyDevice::initLibrary())
     {
@@ -2017,9 +2098,11 @@ StreamTune find_max_stable_fps(
     }
 
     std::vector<int> cands;
-    if (usb2)
+    if (tune.eth_mbps >= 2500)
     {
-        cands = {4, 3, 2};
+        // 2.5G 上联可让两台各自千兆的相机接近额定 14fps；是否真的可行
+        // 仍由下面的完整帧实测决定。
+        cands = {14, 12, 10, 8, 6, 4};
     }
     else
     {
@@ -2655,10 +2738,7 @@ int main(int argc, char ** argv)
                   << std::endl;
         ++failures;
     }
-    for (const auto & v : videos)
-    {
-        std::cout << "  候选: " << v << std::endl;
-    }
+    print_aux_usb_topology("红外", videos);
     if (!check_only && !videos.empty())
     {
         std::cout << "  注: 本机内置摄像头也在候选里(画面是普通彩色图像"
@@ -2693,10 +2773,7 @@ int main(int argc, char ** argv)
                      " 检查 USB 转 485 与驱动(lsusb)" << std::endl;
         ++failures;
     }
-    for (const auto & p : serials)
-    {
-        std::cout << "  候选: " << p << std::endl;
-    }
+    print_aux_usb_topology("传感器", serials);
     if (!check_only && !serials.empty())
     {
         for (const auto & p : serials)
