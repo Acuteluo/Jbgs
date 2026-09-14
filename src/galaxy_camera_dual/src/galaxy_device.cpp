@@ -257,12 +257,14 @@ GX_STATUS GalaxyDevice::openInternal(const DeviceAddress & address)
     // 注意: 调用方必须已持有 mutex_。
     //
     // GxIAPI 要求 GXOpenDevice 之前先刷新内部设备列表, 否则可能返回
-    // GX_STATUS_NOT_FOUND_DEVICE。刷列表会改写 SDK 全局状态, 因此临时
-    // 拿一下 g_list_mutex(锁顺序固定为: mutex_ -> g_list_mutex)。
+    // GX_STATUS_NOT_FOUND_DEVICE。超时必须覆盖跨网段枚举: 500ms 时
+    // 列表经常不完整, 随后 GXOpenDevice 报 -14(TIMEOUT), 看起来像网段
+    // 错误。刷列表会改写 SDK 全局状态, 因此临时拿一下 g_list_mutex
+    // (锁顺序固定为: mutex_ -> g_list_mutex)。
     {
         std::lock_guard<std::mutex> lock(g_list_mutex);
         uint32_t count = 0;
-        GXUpdateAllDeviceList(&count, 500);
+        GXUpdateAllDeviceList(&count, 3000);
     }
 
     GX_STATUS status = GX_STATUS_ERROR;

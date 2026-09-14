@@ -64,6 +64,15 @@ using galaxy_camera_dual::GalaxyDevice;
 namespace
 {
 
+/// 向导里枚举相机的超时。1500ms 在 NM reapply/改 MTU 后或 169.254
+/// 路由被坞口残留抢走时经常返回 0 台; 4s 覆盖 SDK 实际耗时。
+constexpr uint32_t kGalaxyEnumTimeoutMs = 4000;
+
+std::string nm_active_connection(const std::string & nic);
+bool parse_inet_addr_line(const std::string & line,
+                          std::string * cidr, std::string * scope);
+int nic_eth_speed_mbps(const std::string & nic);
+
 // ----------------------------------------------------------------------
 // 终端小工具
 // ----------------------------------------------------------------------
@@ -711,10 +720,31 @@ std::string select_wired_nic()
                   << " (自动采用)" << std::endl;
         return cands.front();
     }
-    std::cout << "  检测到多块有线网卡:" << std::endl;
+    std::cout << "  检测到多块有线网卡(请选相机交换机那口, 不要选无载波的坞网口):"
+              << std::endl;
     for (size_t i = 0; i < cands.size(); ++i)
     {
-        std::cout << "    [" << (i + 1) << "] " << cands[i] << std::endl;
+        const std::string & name = cands[i];
+        std::ifstream cf("/sys/class/net/" + name + "/carrier");
+        int carrier = 0;
+        cf >> carrier;
+        std::ifstream sf("/sys/class/net/" + name + "/speed");
+        int speed = -1;
+        sf >> speed;
+        std::cout << "    [" << (i + 1) << "] " << name;
+        if (carrier != 1)
+        {
+            std::cout << "  无载波(不要选; 多半是坞以太网残留)";
+        }
+        else if (speed > 0)
+        {
+            std::cout << "  有载波 " << speed << "Mb/s";
+        }
+        else
+        {
+            std::cout << "  有载波";
+        }
+        std::cout << std::endl;
     }
     std::cout << "  输入连接相机交换机的网卡编号: " << std::flush;
     std::string a;
@@ -770,18 +800,69 @@ std::string nic_name_from_mac(const std::string & mac,
     return "";
 }
 
-/// 相机交换机实际所在网口: 优先 SDK MAC 且有载波; 否则在同网段、有
-/// 载波的有线口里选。skipped_down_nic 带回 SDK 误报的无载波口(若有)。
+/// ping -I 指定网口; 该口必须已有相机网段地址, 否则会因无源地址失败。
+bool nic_reaches_camera(const std::string & nic, const std::string & ip)
+{
+    if (nic.empty() || ip.empty())
+    {
+        return false;
+    }
+    const std::string cmd =
+        "ping -c 1 -W 1 -I " + nic + " " + ip + " >/dev/null 2>&1";
+    return std::system(cmd.c_str()) == 0;
+}
+
+std::string nic_with_max_eth_speed(const std::vector<std::string> & nics)
+{
+    std::string best;
+    int best_sp = -1;
+    for (const auto & n : nics)
+    {
+        const int sp = nic_eth_speed_mbps(n);
+        if (sp > best_sp)
+        {
+            best_sp = sp;
+            best = n;
+        }
+    }
+    return best;
+}
+
+/// 相机交换机实际所在网口。GxGVTL 的 NICMAC 在多口都挂 169.254.100.1
+/// 时会乱报(本机曾把千兆 enp44s0 上的相机报成百兆 enp45s0)。先 ping,
+/// 再信 SDK MAC。skipped_down_nic 带回 SDK 误报的无载波口(若有)。
 std::string resolve_camera_nic(const std::vector<DeviceInfo> & cams,
                                std::string * skipped_down_nic = nullptr)
 {
+    const std::string cam_ip = cams.empty() ? "" : cams.front().ip;
+    if (!cam_ip.empty())
+    {
+        std::vector<std::string> ping_hits;
+        for (const std::string & nic : list_wired_nics())
+        {
+            if (nic_has_carrier(nic) && nic_reaches_camera(nic, cam_ip))
+            {
+                ping_hits.push_back(nic);
+            }
+        }
+        if (ping_hits.size() == 1)
+        {
+            return ping_hits.front();
+        }
+        if (ping_hits.size() > 1)
+        {
+            return nic_with_max_eth_speed(ping_hits);
+        }
+    }
+
     std::string down_from_mac;
+    std::string sdk_up;
     for (const auto & d : cams)
     {
         const std::string up = nic_name_from_mac(d.nic_mac, true);
-        if (!up.empty())
+        if (!up.empty() && sdk_up.empty())
         {
-            return up;
+            sdk_up = up;
         }
         const std::string any = nic_name_from_mac(d.nic_mac, false);
         if (!any.empty() && !nic_has_carrier(any))
@@ -792,6 +873,10 @@ std::string resolve_camera_nic(const std::vector<DeviceInfo> & cams,
     if (skipped_down_nic != nullptr)
     {
         *skipped_down_nic = down_from_mac;
+    }
+    if (!sdk_up.empty())
+    {
+        return sdk_up;
     }
     const auto nics = list_host_ipv4();
     for (const auto & d : cams)
@@ -810,6 +895,65 @@ std::string resolve_camera_nic(const std::vector<DeviceInfo> & cams,
         }
     }
     return "";
+}
+
+/// SDK/路由把相机算在百兆口、且该口 ping 不通时, 改用同机千兆口。
+/// 百兆拒绝规则本身不放宽: 真在百兆链路上双 5MP 仍不能写帧率。
+std::string correct_camera_nic_if_too_slow(
+    const std::string & camera_nic, const std::vector<DeviceInfo> & cams,
+    bool check_only, bool auto_fix)
+{
+    if (camera_nic.empty())
+    {
+        return camera_nic;
+    }
+    const int sp = nic_eth_speed_mbps(camera_nic);
+    if (sp <= 0 || sp >= 1000)
+    {
+        return camera_nic;
+    }
+    const std::string cam_ip = cams.empty() ? "" : cams.front().ip;
+    const bool ping_ok = nic_reaches_camera(camera_nic, cam_ip);
+    if (ping_ok)
+    {
+        return camera_nic;
+    }
+    std::vector<std::string> gige;
+    for (const std::string & nic : list_wired_nics())
+    {
+        if (nic == camera_nic || !nic_has_carrier(nic))
+        {
+            continue;
+        }
+        if (nic_eth_speed_mbps(nic) >= 1000)
+        {
+            gige.push_back(nic);
+        }
+    }
+    if (gige.empty())
+    {
+        return camera_nic;
+    }
+    const std::string suggest = nic_with_max_eth_speed(gige);
+    std::cout << "  [诊断] SDK 把相机算在 " << camera_nic << " ("
+              << sp << " Mb/s), 但该口 ping " << cam_ip
+              << " 不通。同机千兆口 " << suggest
+              << " 更像相机交换机; 若先清掉千兆口上的 169.254 会彻底丢相机。"
+              << std::endl;
+    if (check_only)
+    {
+        std::cout << "  [失败] --check 不改口。请把交换机插到千兆口, "
+                     "或重跑交互向导让它改用 " << suggest << std::endl;
+        return camera_nic;
+    }
+    if (auto_fix ||
+        ask_yes("  是否改用 " + suggest + " 作为相机网口?", true))
+    {
+        std::cout << "  [已纠正] 相机网口 " << camera_nic << " -> "
+                  << suggest << std::endl;
+        return suggest;
+    }
+    return camera_nic;
 }
 
 /// 无载波有线口上若还挂着相机网段地址, 会抢走 169.254 路由(metric 优于
@@ -846,8 +990,157 @@ void cleanup_stale_addrs_on_down_nics(const std::string & live_nic,
         {
             std::cout << "  [警告] 未能清理 " << nic << " 残留地址"
                       << std::endl;
+            continue;
+        }
+        // 不立刻 reapply: 只改掉 NM 里的静态地址, 避免残留下次又被写回。
+        const std::string con = nm_active_connection(nic);
+        if (!con.empty())
+        {
+            const std::string mod =
+                "sudo nmcli con mod '" + con +
+                "' ipv4.addresses '' ipv4.method disabled >/dev/null 2>&1";
+            if (std::system(mod.c_str()) == 0)
+            {
+                std::cout << "  [清理] 已去掉 NM 连接 \"" << con
+                          << "\" 上的残留 IPv4(坞口无网线, 红外 USB 不受影响)"
+                          << std::endl;
+            }
         }
     }
+}
+
+/// 相机网段地址只能留在 live_nic。其它仍有载波的口若也挂着同一个
+/// 169.254.100.1, 内核按 metric 把控制包送到错误口; ping/open 会失败。
+/// 只删相机网段地址, 其它地址(如 mid360 的 192.168.1.50)不动。
+void strip_cam_subnet_from_other_nics(const std::string & live_nic,
+                                      const std::string & cam_ip)
+{
+    const std::string subnet = cam_subnet(cam_ip);
+    for (const std::string & nic : list_wired_nics())
+    {
+        if (nic == live_nic || !nic_has_carrier(nic))
+        {
+            continue;
+        }
+        std::vector<std::string> victims;
+        std::vector<std::string> keep;
+        if (auto * fp = popen(
+                ("ip -4 -o addr show dev " + nic + " 2>/dev/null").c_str(),
+                "r"))
+        {
+            char line[512];
+            while (fgets(line, sizeof(line), fp) != nullptr)
+            {
+                std::string addr, scope;
+                if (!parse_inet_addr_line(line, &addr, &scope))
+                {
+                    continue;
+                }
+                if (cam_subnet(addr) == subnet)
+                {
+                    victims.push_back(addr);
+                }
+                else
+                {
+                    keep.push_back(addr);
+                }
+            }
+            pclose(fp);
+        }
+        if (victims.empty())
+        {
+            continue;
+        }
+        for (const auto & cidr : victims)
+        {
+            std::cout << "  [清理] " << nic << " 不是所选相机口, 去掉抢路由的 "
+                      << cidr << " (保留该口其它地址)" << std::endl;
+            std::system(("sudo ip addr del " + cidr + " dev " + nic +
+                         " >/dev/null 2>&1").c_str());
+        }
+        const std::string con = nm_active_connection(nic);
+        if (con.empty() || keep.empty())
+        {
+            continue;
+        }
+        std::string csv = keep.front();
+        for (size_t i = 1; i < keep.size(); ++i)
+        {
+            csv += "," + keep[i];
+        }
+        const std::string mod = "sudo nmcli con mod '" + con +
+            "' ipv4.method manual ipv4.addresses \"" + csv +
+            "\" >/dev/null 2>&1";
+        std::system(mod.c_str());
+    }
+}
+
+std::string cidr_ip_part(const std::string & cidr)
+{
+    const size_t slash = cidr.find('/');
+    return slash == std::string::npos ? cidr : cidr.substr(0, slash);
+}
+
+/// 相机口不要再挂一份其它口已有的地址。本机两口都挂 192.168.1.50 时,
+/// GxGVTL 把控制源写成 NICIP=192.168.1.50 / enp45s0, 枚举看得到但
+/// open 超时 -14。mid360 地址只应留在真正那一口。
+void drop_duplicate_addrs_from_nic(const std::string & nic,
+                                   std::vector<std::string> * kept)
+{
+    if (kept == nullptr)
+    {
+        return;
+    }
+    std::vector<std::string> remain;
+    remain.reserve(kept->size());
+    for (const auto & cidr : *kept)
+    {
+        const std::string ip = cidr_ip_part(cidr);
+        bool elsewhere = false;
+        for (const auto & p : list_host_ipv4())
+        {
+            if (p.second != nic && p.first == ip)
+            {
+                elsewhere = true;
+                break;
+            }
+        }
+        if (elsewhere)
+        {
+            std::cout << "  [清理] " << nic << " 上与其它网口重复的 " << cidr
+                      << " 已去掉(留在另一口, 如 mid360)。"
+                         "否则 GxGVTL 会把控制源绑到错误网卡, open 超时 -14"
+                      << std::endl;
+            std::system(("sudo ip addr del " + cidr + " dev " + nic +
+                         " >/dev/null 2>&1").c_str());
+            continue;
+        }
+        remain.push_back(cidr);
+    }
+    *kept = remain;
+}
+
+bool sdk_control_on_cam_subnet(const DeviceInfo & d)
+{
+    if (d.nic_ip.empty() || d.ip.empty())
+    {
+        return true;
+    }
+    return cam_subnet(d.nic_ip) == cam_subnet(d.ip);
+}
+
+/// 自举/修复前: 清无载波口残留, 再清其它活口上重复的相机网段地址。
+void prepare_camera_nic_routes(const std::string & live_nic,
+                               const std::string & cam_ip)
+{
+    cleanup_stale_addrs_on_down_nics(live_nic, cam_ip);
+    strip_cam_subnet_from_other_nics(live_nic, cam_ip);
+}
+
+/// NM reapply / 改 MTU 后接口会闪断, 立刻枚举常得到 0 台。
+void wait_nic_settle()
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 }
 
 /// 读 /sys/class/net/<nic>/mtu; 失败返回 -1。
@@ -1375,6 +1668,16 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
                   << (camera_nic.empty() ? "未知" : camera_nic)
                   << "。坞上 USB 红外/传感器不受影响" << std::endl;
     }
+    const std::string nic_before = camera_nic;
+    camera_nic = correct_camera_nic_if_too_slow(
+        camera_nic, cams, check_only, auto_fix);
+    if (check_only && camera_nic == nic_before &&
+        nic_eth_speed_mbps(camera_nic) > 0 &&
+        nic_eth_speed_mbps(camera_nic) < 1000 &&
+        !nic_reaches_camera(camera_nic, cams.front().ip))
+    {
+        ++(*failures);
+    }
     if (camera_nic.empty())
     {
         std::cout << "  [警告] 无法确定相机所在网口, 跳过网卡诊断与修复"
@@ -1400,7 +1703,7 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
     const std::string cam_addr = host_addr_in_cam_subnet(cams.front().ip);
     if (!check_only)
     {
-        cleanup_stale_addrs_on_down_nics(camera_nic, cams.front().ip);
+        prepare_camera_nic_routes(camera_nic, cams.front().ip);
         // GRO 会把 GVSP UDP 聚错; 即使 MTU/ring 已就绪也要关。
         std::system(("sudo ethtool -K " + camera_nic +
                      " gro off 2>/dev/null").c_str());
@@ -1471,6 +1774,7 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
             ++(*failures);
             return false;
         }
+        drop_duplicate_addrs_from_nic(camera_nic, &kept);
         std::cout << "  [已修复] " << cam_addr << " 已是 " << camera_nic
                   << " 首个可用地址" << std::endl;
         persist_addresses_nm(camera_nic, cam_addr, kept, want_mtu);
@@ -1513,6 +1817,7 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
                     rest.push_back(a);
                 }
             }
+            drop_duplicate_addrs_from_nic(camera_nic, &rest);
             persist_addresses_nm(camera_nic, cam_addr, rest, want_mtu);
             if (!cam_is_first_control_address())
             {
@@ -2066,8 +2371,19 @@ StreamTune find_max_stable_fps(
     if (tune.eth_mbps > 0 && tune.eth_mbps < 1000)
     {
         std::cout << "  [拒绝配置] " << camera_nic << " 仅协商到 "
-                  << tune.eth_mbps << " Mb/s；请检查网线/交换机端口，"
-                     "恢复千兆后再测。" << std::endl;
+                  << tune.eth_mbps << " Mb/s；双 5MP 在百兆上写不出稳定帧率"
+                     "（不是阈值过严）。请检查该口网线/交换机是否千兆；"
+                     "若相机交换机其实插在另一块千兆网口，重跑向导改选那口。"
+                  << std::endl;
+        return tune;
+    }
+    if (!sdk_control_on_cam_subnet(cams.front()))
+    {
+        std::cout << "  [拒绝探测] GxGVTL 控制源是 " << cams.front().nic_ip
+                  << " (网卡 " << nic_name_from_mac(cams.front().nic_mac, true)
+                  << "), 不在相机网段 " << cams.front().ip
+                  << "。open 会超时 -14。相机口不要与其它口重复挂 "
+                     "192.168.1.50。" << std::endl;
         return tune;
     }
 
@@ -2510,7 +2826,7 @@ int main(int argc, char ** argv)
     std::vector<DeviceInfo> cams;
     if (GalaxyDevice::initLibrary())
     {
-        cams = GalaxyDevice::listDevices(1500);
+        cams = GalaxyDevice::listDevices(kGalaxyEnumTimeoutMs);
         GalaxyDevice::closeLibrary();
     }
     else
@@ -2530,6 +2846,10 @@ int main(int argc, char ** argv)
         std::cout << "  找到: [" << d.index << "] " << d.model_name
                   << " SN=" << d.serial_number << " IP=" << d.ip
                   << " MAC=" << d.mac;
+        if (!d.nic_ip.empty())
+        {
+            std::cout << " 控制源=" << d.nic_ip;
+        }
         const std::string cam_nic = nic_name_from_mac(d.nic_mac, true);
         const std::string cam_nic_any = nic_name_from_mac(d.nic_mac, false);
         if (!cam_nic.empty())
@@ -2542,6 +2862,39 @@ int main(int argc, char ** argv)
                       << ", 无载波已忽略)";
         }
         std::cout << std::endl;
+    }
+    if (cams.size() < 2)
+    {
+        for (const std::string & nic : list_wired_nics())
+        {
+            bool has_lla = false;
+            for (const auto & p : list_host_ipv4())
+            {
+                if (p.second == nic && cam_subnet(p.first) == "169.254")
+                {
+                    has_lla = true;
+                    break;
+                }
+            }
+            if (!has_lla)
+            {
+                continue;
+            }
+            if (!nic_has_carrier(nic))
+            {
+                std::cout << "  [诊断] " << nic
+                          << " 无载波但仍占着 169.254, 相机会被路由进黑洞;"
+                             " 选对板载口后向导会清掉(坞上 USB 红外/传感器不受影响)"
+                          << std::endl;
+            }
+            else
+            {
+                std::cout << "  [诊断] " << nic
+                          << " 也挂着 169.254.100.1; 多口同地址会抢路由,"
+                             " 只应留在相机交换机那口"
+                          << std::endl;
+            }
+        }
     }
     // ---- 网段自动诊断与修复(必须在预览之前: 不同段时预览也打不开) ----
     // --tune-fps 也要修地址: 换口后不修则 open 超时, 测不出帧率。
@@ -2639,6 +2992,9 @@ int main(int argc, char ** argv)
                 ++failures;
                 return 1;
             }
+            // 先清坞口/其它口上重复的 169.254.100.1, 再给所选口加地址。
+            // 否则内核把相机网段路由到 NO-CARRIER 的坞网口, 枚举仍是 0。
+            prepare_camera_nic_routes(nic, "169.254.100.1");
             // 相机出厂默认 169.254.x.x; 用固定主机地址 169.254.100.1/16,
             // 且必须调到网卡首地址(GxGVTL 以首地址为控制源, 非首位会
             // open 超时)。其余既有地址(如 mid360)原序保留。
@@ -2649,16 +3005,18 @@ int main(int argc, char ** argv)
                 ++failures;
                 return 1;
             }
+            drop_duplicate_addrs_from_nic(nic, &kept);
             std::cout << "  [已修复] 169.254.100.1/16 已加入 " << nic
                       << " (首地址)" << std::endl;
             persist_addresses_nm(nic, "169.254.100.1/16", kept,
                                  recommended_mtu(nic_usb_speed_mbps(nic)));
             configure_gige_nic(nic, max_rx_ring(nic),
                                recommended_mtu(nic_usb_speed_mbps(nic)));
+            wait_nic_settle();
             std::cout << "  [已修复] 重新枚举..." << std::endl;
             if (GalaxyDevice::initLibrary())
             {
-                cams = GalaxyDevice::listDevices(1500);
+                cams = GalaxyDevice::listDevices(kGalaxyEnumTimeoutMs);
                 GalaxyDevice::closeLibrary();
             }
             for (const auto & d : cams)
@@ -2666,12 +3024,25 @@ int main(int argc, char ** argv)
                 std::cout << "  找到: [" << d.index << "] "
                           << d.model_name << " SN=" << d.serial_number
                           << " IP=" << d.ip;
+                if (!d.nic_ip.empty())
+                {
+                    std::cout << " 控制源=" << d.nic_ip;
+                }
                 const std::string cam_nic2 = nic_name_from_mac(d.nic_mac, true);
                 if (!cam_nic2.empty())
                 {
                     std::cout << " (所在网卡 " << cam_nic2 << ")";
                 }
                 std::cout << std::endl;
+            }
+            if (cams.size() >= 2)
+            {
+                ensure_gige_subnet(cams, false, &failures, false);
+                if (GalaxyDevice::initLibrary())
+                {
+                    cams = GalaxyDevice::listDevices(kGalaxyEnumTimeoutMs);
+                    GalaxyDevice::closeLibrary();
+                }
             }
         }
     }
@@ -2696,6 +3067,11 @@ int main(int argc, char ** argv)
     {
         std::cout << "\n[1b] 双机同时取流测带宽, 自动选择最高稳定帧率..."
                   << std::endl;
+        if (GalaxyDevice::initLibrary())
+        {
+            cams = GalaxyDevice::listDevices(kGalaxyEnumTimeoutMs);
+            GalaxyDevice::closeLibrary();
+        }
         tuned = find_max_stable_fps(cams, camera_nic_of(cams));
         print_stream_settings_summary(tuned);
         if (tuned.fps <= 0.0)
