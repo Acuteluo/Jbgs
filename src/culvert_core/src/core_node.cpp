@@ -972,18 +972,18 @@ void CoreNode::DrawSensorOverlay(cv::Mat & canvas)
             cv::Scalar(120, 200, 255);           // 橙: 部分字段失效
     }
 
-    // 半透明黑底: 提高任何背景下的可读性。
-    // y 从 60 起(避开窗格顶部 52px 信息条), 大字号全屏可读。
-    const cv::Rect bg(6, 60, 600, 150);
+    // 相机画面在竖长窗格中等比居中，顶部为留白区；传感器框仅在该留白
+    // 内加深，绝不改变三路实时回传图的坐标、大小或位置。
+    const cv::Rect bg(6, 60, 560, 120);
     cv::Mat roi = canvas(bg);
     cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
     cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
     cv::rectangle(canvas, bg, color, 1, cv::LINE_AA);
 
-    cv::putText(canvas, line1, cv::Point(16, 112),
-                cv::FONT_HERSHEY_SIMPLEX, 0.88, color, 1, cv::LINE_AA);
-    cv::putText(canvas, line2, cv::Point(16, 162),
-                cv::FONT_HERSHEY_SIMPLEX, 0.75, color, 1, cv::LINE_AA);
+    cv::putText(canvas, line1, cv::Point(14, 104),
+                cv::FONT_HERSHEY_SIMPLEX, 0.72, color, 1, cv::LINE_AA);
+    cv::putText(canvas, line2, cv::Point(14, 148),
+                cv::FONT_HERSHEY_SIMPLEX, 0.62, color, 1, cv::LINE_AA);
 }
 
 void CoreNode::DrawNavOverlay(cv::Mat & canvas)
@@ -1007,8 +1007,11 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
         color = cv::Scalar(60, 220, 220);     // 黄: 取图中
     }
 
-    // 半透明黑底(传感器块下方): 三行大字 —— 收到的指令 / 发出的状态 / 状态词
-    const cv::Rect bg(6, 224, 600, 200);
+    // 唯一新增布局: 导航通信框位于第二张图上方，尺寸与传感器框一致。
+    constexpr int kOverlayWidth = 560;
+    constexpr int kOverlayHeight = 120;
+    const int x = pane_width_ + pane_gap_ + 6;
+    const cv::Rect bg(x, 60, kOverlayWidth, kOverlayHeight);
     cv::Mat roi = canvas(bg);
     cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
     cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
@@ -1018,12 +1021,12 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
     std::snprintf(l_nav, sizeof(l_nav), "NAV->VIS  0x%02X", cmd);
     char l_vis[64];
     std::snprintf(l_vis, sizeof(l_vis), "VIS->NAV  0x%02X", st);
-    cv::putText(canvas, l_nav, cv::Point(16, 268),
-                cv::FONT_HERSHEY_SIMPLEX, 0.88, color, 1, cv::LINE_AA);
-    cv::putText(canvas, l_vis, cv::Point(16, 322),
-                cv::FONT_HERSHEY_SIMPLEX, 0.88, color, 1, cv::LINE_AA);
-    cv::putText(canvas, state, cv::Point(16, 384),
-                cv::FONT_HERSHEY_SIMPLEX, 0.72, color, 1, cv::LINE_AA);
+    cv::putText(canvas, l_nav, cv::Point(x + 10, 94),
+                cv::FONT_HERSHEY_SIMPLEX, 0.54, color, 1, cv::LINE_AA);
+    cv::putText(canvas, l_vis, cv::Point(x + 10, 128),
+                cv::FONT_HERSHEY_SIMPLEX, 0.54, color, 1, cv::LINE_AA);
+    cv::putText(canvas, state, cv::Point(x + 10, 160),
+                cv::FONT_HERSHEY_SIMPLEX, 0.50, color, 1, cv::LINE_AA);
 }
 
 // ============================== 同屏显示线程 ==============================

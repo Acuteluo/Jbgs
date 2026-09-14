@@ -153,7 +153,7 @@ private:
 
     /// 传感器数据标注块(画在总图左上角, 半透明底 + 两行 ASCII 文本)。
     void DrawSensorOverlay(cv::Mat & canvas);
-    /// 导航协议标注块: 实时显示收到的指令/发出的状态/对应状态词。
+    /// 导航协议标注块: 位于第二窗格顶部，显示收到的指令/发出的状态/状态词。
     void DrawNavOverlay(cv::Mat & canvas);
 
     /// 窗格顶部信息条(标题 + 帧率 + 检测摘要)。
