@@ -35,11 +35,13 @@
 #include <array>     // std::array: 显示线程的三窗格表
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <string>
 #include <typeinfo>
 #include <utility>   // std::pair
@@ -126,6 +128,67 @@ cv::Mat IrBackgroundView(const IrSeepageResult & result, const cv::Mat & fallbac
     return fallback.clone();
 }
 
+/// OpenCV 的 Qt 后端会按显示器的 device-pixel-ratio 放大窗口内容。
+/// xrandr 报的是物理像素；若直接拿它作为 cv::Mat 尺寸，在高 DPI
+/// 屏幕上画布会被再次放大并从右侧裁掉（正是三相机变成“两大一窄”的
+/// 原因）。这里从 xrandr 的显示器物理尺寸估算整数缩放比，后续画布
+/// 始终按 Qt 的逻辑像素创建。普通 96 DPI 显示器返回 1，不改变旧布局。
+int DetectQtLogicalScale(int screen_w, int screen_h)
+{
+    // 显式 QT_SCALE_FACTOR 优先，便于部署环境有意覆盖自动策略。
+    if (const char * factor = std::getenv("QT_SCALE_FACTOR"); factor != nullptr)
+    {
+        try
+        {
+            const double value = std::stod(factor);
+            if (value >= 1.0 && value <= 4.0)
+            {
+                return std::clamp(static_cast<int>(std::lround(value)), 1, 4);
+            }
+        }
+        catch (const std::exception &)
+        {
+            // 非法环境变量退回自动探测，不让显示线程失效。
+        }
+    }
+
+    if (auto * fp = popen("xrandr --current 2>/dev/null", "r"))
+    {
+        // 例如：eDP-1 connected primary 2880x1920+0+0 ... 300mm x 200mm
+        const std::regex geometry(
+            R"((\d+)x(\d+)\+\d+\+\d+.*?(\d+)mm x (\d+)mm)");
+        char line[512];
+        while (fgets(line, sizeof(line), fp) != nullptr)
+        {
+            if (strstr(line, " connected") == nullptr)
+            {
+                continue;
+            }
+            std::cmatch match;
+            if (!std::regex_search(line, match, geometry) || match.size() != 5)
+            {
+                continue;
+            }
+            const int width = std::stoi(match[1].str());
+            const int height = std::stoi(match[2].str());
+            const int width_mm = std::stoi(match[3].str());
+            const int height_mm = std::stoi(match[4].str());
+            if (width != screen_w || height != screen_h ||
+                width_mm <= 0 || height_mm <= 0)
+            {
+                continue;
+            }
+            const double dpi = std::max(
+                width * 25.4 / width_mm, height * 25.4 / height_mm);
+            pclose(fp);
+            return std::clamp(
+                static_cast<int>(std::floor(dpi / 96.0)), 1, 4);
+        }
+        pclose(fp);
+    }
+    return 1;
+}
+
 /// 相对路径解析: 以 JBGS_ROOT 环境变量(run.sh 导出)为基准,
 /// 未设置时退化为进程 cwd。绝对路径原样返回。
 std::string ResolvePath(const std::string & path)
@@ -156,8 +219,8 @@ CoreNode::CoreNode()
     save_dir_ = ResolvePath(save_dir_);
     yolo_model_path_ = ResolvePath(yolo_model_path_);
 
-    // 全屏模式: 探测屏幕分辨率, 窗格高度按画布:屏幕 = 1:1 反推
-    // (画布宽 = 3*pane_w + 2*gap, 与屏幕同比 => 铺满无黑边)。
+    // 全屏模式：三个窗格按 Qt 的“逻辑像素”严格三等分整屏。xrandr 的
+    // 物理像素在高 DPI 屏幕上会被 Qt 再放大一次，故不能直接作为 Mat 尺寸。
     if (fullscreen_)
     {
         int screen_w = 0;
@@ -191,14 +254,20 @@ CoreNode::CoreNode()
         }
         screen_w_ = screen_w;
         screen_h_ = screen_h;
-        pane_height_ = static_cast<int>(std::round(
-            (3.0 * pane_width_ + 2.0 * pane_gap_) * screen_h /
-            static_cast<double>(screen_w)));
+        const int qt_scale = DetectQtLogicalScale(screen_w_, screen_h_);
+        const int logical_w = std::max(1, screen_w_ / qt_scale);
+        const int logical_h = std::max(1, screen_h_ / qt_scale);
+        // 保留 7ac2f64 的“横向三等分、纵向铺满”语义；余数作为最右侧
+        // 的极窄边缘，不会改变任一实时画面的比例或坐标。
+        pane_width_ = std::max(1, (logical_w - 2 * pane_gap_) / 3);
+        pane_height_ = logical_h;
         RCLCPP_INFO(
             get_logger(),
-            "全屏展示: 屏幕 %dx%d, 画布 %dx%d (窗格 %dx%d, 图像等比留边)",
-            screen_w_, screen_h_, 3 * pane_width_ + 2 * pane_gap_,
-            pane_height_, pane_width_, pane_height_);
+            "全屏展示: 物理屏幕 %dx%d, Qt 缩放 %dx, 逻辑画布 %dx%d "
+            "(三等分窗格 %dx%d, 图像等比留边)",
+            screen_w_, screen_h_, qt_scale,
+            3 * pane_width_ + 2 * pane_gap_, pane_height_,
+            pane_width_, pane_height_);
     }
 
     // 2. 三路视频源上下文的静态信息(话题名等)
@@ -974,7 +1043,11 @@ void CoreNode::DrawSensorOverlay(cv::Mat & canvas)
 
     // 相机画面在竖长窗格中等比居中，顶部为留白区；传感器框仅在该留白
     // 内加深，绝不改变三路实时回传图的坐标、大小或位置。
-    const cv::Rect bg(6, 60, 560, 120);
+    // 小屏/高 DPI 的逻辑窗格可能窄于默认 560；两块状态框同步收窄，
+    // 但高度、顶边和实时回传图区域都不变。
+    const int overlay_width = std::max(1, std::min(560, pane_width_ - 12));
+    constexpr int kOverlayHeight = 120;
+    const cv::Rect bg(6, 60, overlay_width, kOverlayHeight);
     cv::Mat roi = canvas(bg);
     cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
     cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
@@ -1008,10 +1081,10 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
     }
 
     // 唯一新增布局: 导航通信框位于第二张图上方，尺寸与传感器框一致。
-    constexpr int kOverlayWidth = 560;
     constexpr int kOverlayHeight = 120;
+    const int overlay_width = std::max(1, std::min(560, pane_width_ - 12));
     const int x = pane_width_ + pane_gap_ + 6;
-    const cv::Rect bg(x, 60, kOverlayWidth, kOverlayHeight);
+    const cv::Rect bg(x, 60, overlay_width, kOverlayHeight);
     cv::Mat roi = canvas(bg);
     cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
     cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
