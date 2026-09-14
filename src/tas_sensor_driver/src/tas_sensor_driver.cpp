@@ -164,7 +164,7 @@ void TasSensorDriver::getParams()
         "poll=%dms timeout=%dms gap=%dms",
         device_name_.c_str(), baud_rate_, parity_.c_str(), stop_bits_.c_str(),
         flow_control_.c_str(), modbus_addr_,
-        poll_interval_ms_, query_timeout_ms_, inter_query_gap_ms_);
+        poll_interval_ms_.load(), query_timeout_ms_.load(), inter_query_gap_ms_.load());
     if (sim_mode_)
     {
         RCLCPP_INFO(
@@ -265,12 +265,19 @@ bool TasSensorDriver::sendFrame(const std::vector<uint8_t> & frame)
             // EIO 等: 设备被拔/出错
             return false;
         }
+        // 阻塞 fd 上 write 返回 0 不代表已写入任何字节；若继续循环会空转。
+        if (n == 0)
+        {
+            errno = EIO;
+            return false;
+        }
         offset += static_cast<size_t>(n);
     }
     return true;
 }
 
-bool TasSensorDriver::receiveFrame(std::vector<uint8_t> * frame, int timeout_ms)
+bool TasSensorDriver::receiveFrame(
+    std::vector<uint8_t> * frame, int timeout_ms, uint8_t expected_addr)
 {
     frame->clear();
     const auto deadline =
@@ -286,6 +293,7 @@ bool TasSensorDriver::receiveFrame(std::vector<uint8_t> * frame, int timeout_ms)
         {
             // 清掉可能还在路上的迟到/半截帧, 防止串到下一问询
             tcflush(fd_, TCIFLUSH);
+            errno = ETIMEDOUT;
             return false;
         }
 
@@ -313,6 +321,13 @@ bool TasSensorDriver::receiveFrame(std::vector<uint8_t> * frame, int timeout_ms)
         {
             if (frame->size() < 2)
             {
+                continue;
+            }
+            // RS485 总线上可能有其他地址的应答。丢弃其帧头并继续同步，
+            // 不能把它当作本机问询的超时或错误应答。
+            if ((*frame)[0] != expected_addr)
+            {
+                frame->erase(frame->begin());
                 continue;
             }
             const uint8_t func = (*frame)[1];
@@ -424,7 +439,7 @@ void TasSensorDriver::pollLoop()
                 publishEnv();
             }
 
-            if (show_logger_)
+            if (show_logger_.load())
             {
                 RCLCPP_INFO(
                     get_logger(),
@@ -479,7 +494,7 @@ void TasSensorDriver::pollLoop()
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - cycle_start).count();
         const int sleep_ms = std::max(
-            50, poll_interval_ms_ - static_cast<int>(elapsed));
+            50, poll_interval_ms_.load() - static_cast<int>(elapsed));
         std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
     }
 
@@ -493,7 +508,7 @@ bool TasSensorDriver::queryRegisters(
 {
     // 保证与上一次问询间隔 ≥ inter_query_gap_ms(传感器要求 ≥200ms)
     std::this_thread::sleep_until(
-        last_query_time_ + std::chrono::milliseconds(inter_query_gap_ms_));
+        last_query_time_ + std::chrono::milliseconds(inter_query_gap_ms_.load()));
 
     // 串口未打开: 尝试打开(设备插回后在这里自动恢复)
     if (fd_ < 0)
@@ -524,7 +539,9 @@ bool TasSensorDriver::queryRegisters(
 
     // 同步等应答(内部带总超时, 超时自动清输入缓冲)
     std::vector<uint8_t> reply;
-    if (!receiveFrame(&reply, query_timeout_ms_))
+    const int timeout_ms = query_timeout_ms_.load();
+    errno = 0;
+    if (!receiveFrame(&reply, timeout_ms, static_cast<uint8_t>(modbus_addr_)))
     {
         // 区分超时与设备错误: errno 置位说明是读错误(设备被拔)
         const int saved_errno = errno;
@@ -539,7 +556,7 @@ bool TasSensorDriver::queryRegisters(
         {
             RCLCPP_WARN_THROTTLE(
                 get_logger(), *get_clock(), 5000,
-                "问询超时(%dms), 已清空输入缓冲", query_timeout_ms_);
+                "问询超时(%dms), 已清空输入缓冲", timeout_ms);
         }
         return false;
     }
@@ -674,7 +691,7 @@ void TasSensorDriver::queryEnvCallback(
     // 等待该轮结束(轮询线程完成一轮后会清掉 force_query_ 并唤醒这里)
     std::unique_lock<std::mutex> lock(reply_mutex_);
     query_cv_.wait_for(
-        lock, std::chrono::milliseconds(poll_interval_ms_ + 3000),
+        lock, std::chrono::milliseconds(poll_interval_ms_.load() + 3000),
         [this]()
         {
             return !force_query_;
@@ -707,19 +724,19 @@ rcl_interfaces::msg::SetParametersResult TasSensorDriver::onParameterChange(
     {
         if (p.get_name() == "poll_interval_ms")
         {
-            poll_interval_ms_ = std::max(500, static_cast<int>(p.as_int()));
+            poll_interval_ms_.store(std::max(500, static_cast<int>(p.as_int())));
         }
         else if (p.get_name() == "query_timeout_ms")
         {
-            query_timeout_ms_ = std::max(200, static_cast<int>(p.as_int()));
+            query_timeout_ms_.store(std::max(200, static_cast<int>(p.as_int())));
         }
         else if (p.get_name() == "inter_query_gap_ms")
         {
-            inter_query_gap_ms_ = std::max(200, static_cast<int>(p.as_int()));
+            inter_query_gap_ms_.store(std::max(200, static_cast<int>(p.as_int())));
         }
         else if (p.get_name() == "show_logger")
         {
-            show_logger_ = p.as_bool();
+            show_logger_.store(p.as_bool());
         }
         else
         {

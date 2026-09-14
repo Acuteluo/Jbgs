@@ -62,7 +62,8 @@ private:
     /// 接收一帧应答(带总超时)。
     /// 返回: true=组满一帧且 CRC 通过; false=超时/读错误/CRC 失败。
     /// 超时返回时内部已 tcflush 清空输入缓冲, 防止残帧串代。
-    bool receiveFrame(std::vector<uint8_t> * frame, int timeout_ms);
+    bool receiveFrame(
+        std::vector<uint8_t> * frame, int timeout_ms, uint8_t expected_addr);
 
     // ==================== 轮询 ====================
 
@@ -125,10 +126,11 @@ private:
     std::string stop_bits_ = "1";     ///< 1 / 2
     std::string flow_control_ = "none";  ///< none / hardware
     int modbus_addr_ = 1;        ///< 从机 Modbus 地址, 出厂 1
-    int poll_interval_ms_ = 1000;   ///< 轮询周期(传感器 2s 更新, 1Hz 合理)
-    int query_timeout_ms_ = 500;    ///< 单次问询等应答超时(≥200ms)
-    int inter_query_gap_ms_ = 200;  ///< 两次问询最小间隔(文档要求 ≥200ms)
-    bool show_logger_ = true;       ///< 是否打印读数日志
+    // 下列参数可由 ROS 动态参数回调修改；轮询线程会同时读取，必须原子访问。
+    std::atomic<int> poll_interval_ms_{1000};   ///< 轮询周期(传感器 2s 更新, 1Hz 合理)
+    std::atomic<int> query_timeout_ms_{500};    ///< 单次问询等应答超时(≥200ms)
+    std::atomic<int> inter_query_gap_ms_{200};  ///< 两次问询最小间隔(文档要求 ≥200ms)
+    std::atomic<bool> show_logger_{true};       ///< 是否打印读数日志
 
     // ==================== 模拟模式参数(sim_mode=true 时生效) ====================
 

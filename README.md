@@ -136,6 +136,8 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 bash tests/run_tests.sh          # 全部（含干净重建，约 8 分钟）
 bash tests/run_tests.sh 05       # 只跑巡检协议
 colcon test --packages-select culvert_inspection   # 状态机 gtest 单测
+colcon test --packages-select tas_sensor_driver --ctest-args -R '^test_modbus_protocol$'
+                                             # 厂商 V1.6 Modbus 报文/CRC 单测
 ```
 
 系统测试（`tests/CMakeLists.txt`，C++ + ctest，全部基于模拟，不依赖真机与外部数据集）：
@@ -150,6 +152,8 @@ colcon test --packages-select culvert_inspection   # 状态机 gtest 单测
 | `07_off_mode` | in_trulyworking=false 不处理不保存 |
 
 单测（gtest，`colcon test`，12 例）另覆盖：触发时刻=第 0 帧、可配置目标帧序号、持续坏帧仍超时（解码失败不计进展）、外部计数路径不重复计数、进展与超时边界、半对文件清理等。
+
+传感器驱动另有 3 个协议单测：直接使用塔石《传感器寄存器定义说明 V1.6》的温湿度、CO2 请求与应答字节，校验 `9600 8N1` 默认协议中的寄存器、CRC 和 16 位数据解码；不需要连接串口设备。
 
 ## 目录结构
 

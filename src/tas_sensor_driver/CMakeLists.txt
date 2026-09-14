@@ -48,8 +48,15 @@ install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
+    find_package(ament_cmake_gtest REQUIRED)
     find_package(ament_lint_auto REQUIRED)
     ament_lint_auto_find_test_dependencies()
+
+    # 厂商 V1.6 手册中的实际 Modbus 报文，防止寄存器/CRC 回归。
+    ament_add_gtest(test_modbus_protocol test/test_modbus_protocol.cpp)
+    if(TARGET test_modbus_protocol)
+        target_link_libraries(test_modbus_protocol ${PROJECT_NAME})
+    endif()
 endif()
 
 ament_package()

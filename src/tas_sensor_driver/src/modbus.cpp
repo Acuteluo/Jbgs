@@ -49,7 +49,10 @@ bool parseReadResponse(
     }
 
     const size_t byte_count = frame[2];
-    if (frame.size() != 5 + byte_count)
+    // Modbus 寄存器固定 16 位；奇数字节数不是合法的读寄存器应答，
+    // 不能悄悄丢掉最后一个字节后继续发布错误数值。
+    if (byte_count == 0 || (byte_count % 2) != 0 ||
+        frame.size() != 5 + byte_count)
     {
         return false;
     }
