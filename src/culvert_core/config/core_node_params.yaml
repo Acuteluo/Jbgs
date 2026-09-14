@@ -20,6 +20,7 @@
     display_fps: 30.0        # 显示刷新率上限(Hz)
     stale_timeout_sec: 3.0   # 超过此时长无新帧 => 该路显示"OFFLINE"占位
     show_img: true           # 是否弹出 culvert_monitor 窗口
+    fullscreen: true         # 无边框占满整屏, 三窗格按屏幕逻辑像素三等分; 不用 GTK 独占全屏
 
     # ==================== YOLO 裂缝检测(左右相机) ====================
     # 左右各一个独立 YoloDetector 实例并行推理(Net 非线程安全, 不共享);

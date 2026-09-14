@@ -25,6 +25,8 @@ find_package(sensor_interfaces REQUIRED)
 
 # OpenCV: JPEG 图像解码(compressed 模式, 检测链路的推荐输入)
 find_package(OpenCV REQUIRED)
+# 无边框铺满用 X11 Motif hints(不用 GTK FULLSCREEN, 避免 Mutter 闪黑)
+find_package(X11)
 
 # 核心节点可执行文件
 add_executable(core_node
@@ -51,6 +53,11 @@ ament_target_dependencies(core_node
 target_link_libraries(core_node
     ${OpenCV_LIBRARIES}
 )
+if(X11_FOUND)
+    target_compile_definitions(core_node PRIVATE JBGS_HAS_X11=1)
+    target_include_directories(core_node PRIVATE ${X11_INCLUDE_DIR})
+    target_link_libraries(core_node ${X11_LIBRARIES})
+endif()
 
 # ---- 单图 YOLO 检测测试工具(与 core_node 共用 yolo_detector/yolo_crack) ----
 # 用法: ros2 run culvert_core test_yolo <图片路径> [模型路径] [conf阈值]

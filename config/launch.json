@@ -2,7 +2,7 @@
   "_说明": "总启动配置: run.sh 启动 bringup/all.launch.py 时读取。键含义见 README。相对路径以工程根目录(run.sh 所在目录)为基准。launch 参数(sim:= 等)优先级高于本文件。",
   "_键说明": {
     "show_windows": "是否弹出同屏大面板(左/右大恒检测叠加 + 红外叠加 + 传感器数据); 无图形环境自动强制关闭",
-    "fullscreen": "面板全屏展示: 窗口无边框占满整屏, 窗格高度按屏幕宽高比自动计算",
+    "fullscreen": "面板全屏展示: 窗口无边框占满整屏, 三路窗格按屏幕逻辑像素三等分; 不用 GTK 独占全屏(避免闪黑)",
     "in_trulyworking": "巡检模式总开关: false 时巡检节点不订阅 0x01、不保存巡检图片",
     "sim_mode": "true=模拟模式(无真机, 相机/传感器由模拟设备出图, 支持热插拔时间窗); false=真机模式",
     "log_level": "ROS 日志级别: debug / info / warn / error",

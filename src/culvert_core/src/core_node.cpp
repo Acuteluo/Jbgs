@@ -30,6 +30,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
 
 #include <algorithm>
 #include <array>     // std::array: 显示线程的三窗格表
@@ -38,6 +39,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -50,6 +52,12 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
+
+#if defined(JBGS_HAS_X11)
+#include <X11/Xatom.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#endif
 
 namespace culvert_core
 {
@@ -128,14 +136,32 @@ cv::Mat IrBackgroundView(const IrSeepageResult & result, const cv::Mat & fallbac
     return fallback.clone();
 }
 
-/// OpenCV 的 Qt 后端会按显示器的 device-pixel-ratio 放大窗口内容。
-/// xrandr 报的是物理像素；若直接拿它作为 cv::Mat 尺寸，在高 DPI
-/// 屏幕上画布会被再次放大并从右侧裁掉（正是三相机变成“两大一窄”的
-/// 原因）。这里从 xrandr 的显示器物理尺寸估算整数缩放比，后续画布
-/// 始终按 Qt 的逻辑像素创建。普通 96 DPI 显示器返回 1，不改变旧布局。
+/// 本机 OpenCV HighGUI 是 GTK 还是 Qt。Ubuntu ROS Humble 的 libopencv
+/// 是 GTK3; 只有 Qt 后端才会按 device-pixel-ratio 再放大一次画布。
+bool OpenCvHighGuiIsQt()
+{
+    const std::string info = cv::getBuildInformation();
+    const auto gui = info.find("GUI:");
+    if (gui != std::string::npos)
+    {
+        const auto line_end = info.find('\n', gui);
+        const std::string line = info.substr(
+            gui, line_end == std::string::npos ? 48 : line_end - gui);
+        if (line.find("GTK") != std::string::npos)
+        {
+            return false;
+        }
+        if (line.find("QT") != std::string::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// OpenCV Qt 后端会按 DPI 再放大窗口。GTK3 不会, 调用方应跳过。
 int DetectQtLogicalScale(int screen_w, int screen_h)
 {
-    // 显式 QT_SCALE_FACTOR 优先，便于部署环境有意覆盖自动策略。
     if (const char * factor = std::getenv("QT_SCALE_FACTOR"); factor != nullptr)
     {
         try
@@ -148,13 +174,10 @@ int DetectQtLogicalScale(int screen_w, int screen_h)
         }
         catch (const std::exception &)
         {
-            // 非法环境变量退回自动探测，不让显示线程失效。
         }
     }
-
     if (auto * fp = popen("xrandr --current 2>/dev/null", "r"))
     {
-        // 例如：eDP-1 connected primary 2880x1920+0+0 ... 300mm x 200mm
         const std::regex geometry(
             R"((\d+)x(\d+)\+\d+\+\d+.*?(\d+)mm x (\d+)mm)");
         char line[512];
@@ -189,6 +212,120 @@ int DetectQtLogicalScale(int screen_w, int screen_h)
     return 1;
 }
 
+#if defined(JBGS_HAS_X11)
+bool X11WindowTitleContains(Display * dpy, Window w, const char * title)
+{
+    Atom net = XInternAtom(dpy, "_NET_WM_NAME", True);
+    Atom utf8 = XInternAtom(dpy, "UTF8_STRING", True);
+    if (net != None && utf8 != None)
+    {
+        Atom actual = None;
+        int fmt = 0;
+        unsigned long nitems = 0;
+        unsigned long after = 0;
+        unsigned char * data = nullptr;
+        if (XGetWindowProperty(
+                dpy, w, net, 0, 256, False, utf8,
+                &actual, &fmt, &nitems, &after, &data) == Success &&
+            data != nullptr)
+        {
+            const std::string name(reinterpret_cast<char *>(data), nitems);
+            XFree(data);
+            if (name.find(title) != std::string::npos)
+            {
+                return true;
+            }
+        }
+    }
+    XTextProperty prop{};
+    if (XGetWMName(dpy, w, &prop) && prop.value != nullptr)
+    {
+        const std::string name(reinterpret_cast<char *>(prop.value));
+        XFree(prop.value);
+        if (name.find(title) != std::string::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+Window X11FindWindowByTitle(Display * dpy, Window root, const char * title,
+                            int depth)
+{
+    if (depth <= 0)
+    {
+        return 0;
+    }
+    Window root_ret = 0;
+    Window parent = 0;
+    Window * children = nullptr;
+    unsigned int n = 0;
+    if (!XQueryTree(dpy, root, &root_ret, &parent, &children, &n) ||
+        children == nullptr)
+    {
+        return 0;
+    }
+    Window found = 0;
+    for (unsigned int i = 0; i < n && found == 0; ++i)
+    {
+        if (X11WindowTitleContains(dpy, children[i], title))
+        {
+            found = children[i];
+            break;
+        }
+        found = X11FindWindowByTitle(dpy, children[i], title, depth - 1);
+    }
+    XFree(children);
+    return found;
+}
+
+/// 无边框铺满屏幕, 外观与旧 GTK FULLSCREEN 一致。
+/// 绝不设置 _NET_WM_STATE_FULLSCREEN / gtk_window_fullscreen:
+/// Mutter 会 unredirect, OpenCV 每帧换 GdkPixbuf 就整屏闪黑。
+void PlaceBorderlessFillScreen(const char * title, int screen_w, int screen_h)
+{
+    Display * dpy = XOpenDisplay(nullptr);
+    if (dpy == nullptr)
+    {
+        return;
+    }
+    Window root = DefaultRootWindow(dpy);
+    Window w = X11FindWindowByTitle(dpy, root, title, 8);
+    if (w != 0)
+    {
+        struct MotifHints
+        {
+            unsigned long flags;
+            unsigned long functions;
+            unsigned long decorations;
+            long input_mode;
+            unsigned long status;
+        };
+        MotifHints hints{};
+        hints.flags = (1L << 0) | (1L << 1);   // FUNCTIONS | DECORATIONS
+        hints.functions = (1L << 0) | (1L << 3);   // ALL | MINIMIZE(任务栏仍可最小化)
+        hints.decorations = 0;
+        Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+        XChangeProperty(
+            dpy, w, motif, motif, 32, PropModeReplace,
+            reinterpret_cast<unsigned char *>(&hints), 5);
+        XMoveResizeWindow(
+            dpy, w, 0, 0,
+            static_cast<unsigned int>(std::max(1, screen_w)),
+            static_cast<unsigned int>(std::max(1, screen_h)));
+        XMapRaised(dpy, w);
+        XFlush(dpy);
+    }
+    XCloseDisplay(dpy);
+}
+#else
+void PlaceBorderlessFillScreen(const char * /*title*/, int /*screen_w*/,
+                               int /*screen_h*/)
+{
+}
+#endif
+
 /// 相对路径解析: 以 JBGS_ROOT 环境变量(run.sh 导出)为基准,
 /// 未设置时退化为进程 cwd。绝对路径原样返回。
 std::string ResolvePath(const std::string & path)
@@ -219,8 +356,9 @@ CoreNode::CoreNode()
     save_dir_ = ResolvePath(save_dir_);
     yolo_model_path_ = ResolvePath(yolo_model_path_);
 
-    // 全屏模式：三个窗格按 Qt 的“逻辑像素”严格三等分整屏。xrandr 的
-    // 物理像素在高 DPI 屏幕上会被 Qt 再放大一次，故不能直接作为 Mat 尺寸。
+    // 全屏模式：三个窗格按逻辑像素严格三等分整屏。xrandr 的物理像素
+    // 在高 DPI 上会被 Qt HighGUI 再放大一次, GTK3 则按 1:1 显示。
+    // 窗格公式与旧版一致: pane_w=(logical_w-2*gap)/3, pane_h=logical_h。
     if (fullscreen_)
     {
         int screen_w = 0;
@@ -254,7 +392,10 @@ CoreNode::CoreNode()
         }
         screen_w_ = screen_w;
         screen_h_ = screen_h;
-        const int qt_scale = DetectQtLogicalScale(screen_w_, screen_h_);
+        // GTK3 不会按 DPI 再放大画布, 切勿套 Qt 缩放, 否则三窗格会算小。
+        const int qt_scale = OpenCvHighGuiIsQt()
+                                 ? DetectQtLogicalScale(screen_w_, screen_h_)
+                                 : 1;
         const int logical_w = std::max(1, screen_w_ / qt_scale);
         const int logical_h = std::max(1, screen_h_ / qt_scale);
         // 保留 7ac2f64 的“横向三等分、纵向铺满”语义；余数作为最右侧
@@ -264,7 +405,7 @@ CoreNode::CoreNode()
         RCLCPP_INFO(
             get_logger(),
             "全屏展示: 物理屏幕 %dx%d, Qt 缩放 %dx, 逻辑画布 %dx%d "
-            "(三等分窗格 %dx%d, 图像等比留边)",
+            "(三等分窗格 %dx%d, 图像等比留边; 无边框铺满, 不用 GTK 独占全屏)",
             screen_w_, screen_h_, qt_scale,
             3 * pane_width_ + 2 * pane_gap_, pane_height_,
             pane_width_, pane_height_);
@@ -360,8 +501,8 @@ void CoreNode::InitParams()
     // 同屏显示
     pane_width_ = declare_parameter("pane_width", 640);
     pane_height_ = declare_parameter("pane_height", 480);
-    // 全屏展示: 窗口无边框占满整屏, 且窗格高度自动按屏幕宽高比计算
-    // (画布与屏幕同比例 => 铺满无黑边; 相机图像在窗格内等比留边)。
+    // 全屏展示: 无边框占满整屏, 窗格高度按屏幕宽高比计算。
+    // 不调用 cv::WINDOW_FULLSCREEN(GTK gtk_window_fullscreen 会闪黑)。
     fullscreen_ = declare_parameter("fullscreen", true);
     // 0 = 自动探测(xrandr); 探测失败时用参数值兜底, 再不行用 1920x1080
     screen_w_ = declare_parameter("screen_width", 0);
@@ -1112,13 +1253,34 @@ void CoreNode::DisplayLoop()
     if (show_img_)
     {
         cv::namedWindow(kWindowName, cv::WINDOW_NORMAL);
+        const int content_w = pane_width_ * 3 + pane_gap_ * 2;
+        int win_w = content_w;
+        int win_h = pane_height_;
+        if (fullscreen_ && screen_w_ > 0 && screen_h_ > 0)
+        {
+            win_w = screen_w_;
+            win_h = screen_h_;
+        }
+        cv::resizeWindow(kWindowName, std::max(1, win_w), std::max(1, win_h));
+        cv::moveWindow(kWindowName, 0, 0);
+        // 先 imshow 一帧让 GTK 真正建出 X11 窗口, 再无边框铺满。
+        // 绝不 setWindowProperty(WND_PROP_FULLSCREEN): Mutter unredirect
+        // 后每帧换 GdkPixbuf 会整屏闪黑。
+        cv::imshow(
+            kWindowName,
+            cv::Mat(std::max(1, win_h), std::max(1, win_w),
+                    CV_8UC3, cv::Scalar(40, 40, 40)));
+        cv::waitKey(30);
         if (fullscreen_)
         {
-            // 无边框占满整屏; 画布与屏幕同比, 铺满无黑边
-            cv::setWindowProperty(
-                kWindowName, cv::WND_PROP_FULLSCREEN,
-                cv::WINDOW_FULLSCREEN);
+            PlaceBorderlessFillScreen(kWindowName, win_w, win_h);
+            cv::waitKey(20);
         }
+        RCLCPP_INFO(
+            get_logger(),
+            "同屏窗口 %s: %s, 画布按窗格原生像素显示(不二次缩放)",
+            kWindowName,
+            fullscreen_ ? "无边框铺满(非 GTK 独占全屏)" : "普通窗口");
     }
 
     const auto frame_interval =
@@ -1129,6 +1291,7 @@ void CoreNode::DisplayLoop()
     auto next_tick = std::chrono::steady_clock::now();
     double display_fps_meas = 0.0;
     auto prev_tick = next_tick;
+    int borderless_tries = 0;
 
     while (rclcpp::ok() && display_run_)
     {
@@ -1153,8 +1316,24 @@ void CoreNode::DisplayLoop()
                     (0.8 * display_fps_meas + 0.2 * (1.0 / dt)) : (1.0 / dt);
             }
 
-            const int canvas_w = pane_width_ * 3 + pane_gap_ * 2;
-            const cv::Size canvas_size(canvas_w, pane_height_);
+            const int content_w = pane_width_ * 3 + pane_gap_ * 2;
+            int canvas_w = content_w;
+            int canvas_h = pane_height_;
+            // GTK 全屏时画布必须与窗口像素 1:1, 否则每帧拉伸闪屏。
+            // 三窗格仍按 pane_width_/gap 摆放(与旧逻辑像素布局一致),
+            // 除不尽的余数留在最右侧灰边, 不改任一画面比例或叠加坐标。
+            if (fullscreen_ && !OpenCvHighGuiIsQt())
+            {
+                if (screen_w_ > canvas_w)
+                {
+                    canvas_w = screen_w_;
+                }
+                if (screen_h_ > canvas_h)
+                {
+                    canvas_h = screen_h_;
+                }
+            }
+            const cv::Size canvas_size(canvas_w, canvas_h);
             cv::Mat canvas(canvas_size, CV_8UC3, cv::Scalar(40, 40, 40));
 
             // ---- 三个窗格: 左 | 右 | 红外 ----
@@ -1244,6 +1423,15 @@ void CoreNode::DisplayLoop()
             if (show_img_)
             {
                 cv::imshow(kWindowName, canvas);
+                // GTK 前几帧可能重建窗口, 再补几次无边框铺满(不走独占全屏)
+                if (fullscreen_ && borderless_tries < 8)
+                {
+                    PlaceBorderlessFillScreen(
+                        kWindowName,
+                        screen_w_ > 0 ? screen_w_ : canvas.cols,
+                        screen_h_ > 0 ? screen_h_ : canvas.rows);
+                    ++borderless_tries;
+                }
                 cv::waitKey(1);
             }
         }

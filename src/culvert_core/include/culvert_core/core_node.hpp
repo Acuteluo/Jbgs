@@ -220,7 +220,7 @@ private:
         left_annotated_pub_;   ///< /core_node/left_annotated
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr
         right_annotated_pub_;  ///< /core_node/right_annotated
-    bool fullscreen_ = true;           ///< 全屏展示(无边框占满整屏, 窗格随屏幕比例)
+    bool fullscreen_ = true;           ///< 全屏展示(无边框占满整屏; 不用 GTK 独占全屏以免闪黑)
     int screen_w_ = 1920;              ///< 屏幕宽(0=启动时 xrandr 自动探测)
     int screen_h_ = 1080;              ///< 屏幕高(0=启动时 xrandr 自动探测)
 
