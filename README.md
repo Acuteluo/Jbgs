@@ -46,7 +46,7 @@ ros2 run galaxy_camera_dual camera_setup_wizard --tune-fps  # 只测/写帧率(�
 | 现象 | 向导表现 | 处置 |
 |---|---|---|
 | 相机未识别（枚举 0 台） | 打印排障清单（网线/PoE、网段、巨帧、防火墙）后以失败退出，不假成功 | 查网线与 PoE 供电；`ip -br addr` 看相机网口是否有地址；临时 `sudo ufw disable` 排除防火墙 |
-| 能枚举、open 超时 -14 | 诊断"首地址不在相机网段"，自动把相机网段地址调到网卡首位（其余地址保序、闪断 1 秒） | 手工修：`sudo ip addr add 169.254.100.1/16 dev <相机网卡>`，且该地址必须排网卡地址列表**首位** |
+| 能枚举、open 超时 -14 | 诊断"首个全局地址不在相机网段"，自动把 `169.254.100.1/16 scope global` 调到网卡首位 | 手工修：`sudo ip addr add 169.254.100.1/16 dev <相机网卡> scope global`，且必须排**全局地址列表首位** |
 | 预览 NO FRAME / 残帧 | `--check` 用双机残帧计数验收；向导按链路选包长 | 固定「恰好 5 张残帧然后断流」是 GXDQBuf 声明错误（已修）。RTL8125B ring 上限 256；板载直插稳 10fps |
 | USB 串口总打不开 | 提示 brltty / ModemManager 抢占 | `sudo systemctl mask --now brltty brltty-udev ModemManager` 后重插 USB |
 | 相机改接 USB 扩展坞（RTL8153） | 打印 USB2/USB3/板载类型；**坞必须插 USB3** | USB2 双 5MP 会打满总线，不写残帧配置。红外/传感器可继续走坞 USB；交换机改插板载后向导忽略坞上网口残留地址 |
