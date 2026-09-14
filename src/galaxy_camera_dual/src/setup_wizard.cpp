@@ -360,6 +360,9 @@ public:
             return false;
         }
         cfmakeraw(&tty);
+        // cfmakeraw() 只设置原始 8N1 位格式，不保证打开接收器；部分
+        // USB-RS485 适配器在 CREAD 未置位时会“能打开但永远收不到应答”。
+        tty.c_cflag |= CLOCAL | CREAD;
         cfsetispeed(&tty, baud);
         cfsetospeed(&tty, baud);
         tty.c_cc[VMIN] = 0;
@@ -568,7 +571,7 @@ bool install_gige_recovery_service(const std::string & nic,
         << "ExecStart=/usr/sbin/ip link set dev " << nic << " mtu " << mtu << "\n"
         << "ExecStart=/usr/sbin/ip -4 addr flush dev " << nic << " scope global\n"
         << "ExecStart=/usr/sbin/ip addr add " << cam_addr_cidr
-        << " dev " << nic << " scope global\n";
+        << " dev " << nic << "\n";
     for (const auto & a : rest_addrs)
     {
         out << "ExecStart=/usr/sbin/ip addr add " << a << " dev " << nic << "\n";
@@ -1095,9 +1098,10 @@ std::vector<std::string> nic_global_ipv4s(const std::string & nic)
     return out;
 }
 
-/// 网卡上"首个全局 IPv4"(GxGVTL 把它用作 GigE 控制通道源地址)。
-/// 返回 CIDR; 无全局地址返回空。scope link(自动 LLA)不算。
-std::string first_global_ipv4(const std::string & nic)
+/// 网卡上首个可作 GigE 控制源的 IPv4。相机出厂的 169.254/16 就是
+/// link-local；实机双机取流已验证它可作为 GxGVTL 源地址，不能误判为
+/// “没有地址”。其它不可路由 scope 不参与判断。
+std::string first_gige_control_ipv4(const std::string & nic)
 {
     const std::string cmd = "ip -4 -o addr show dev " + nic + " 2>/dev/null";
     auto * fp = popen(cmd.c_str(), "r");
@@ -1114,7 +1118,7 @@ std::string first_global_ipv4(const std::string & nic)
         {
             continue;
         }
-        if (scope.rfind("global", 0) == 0)
+        if (scope.rfind("global", 0) == 0 || scope.rfind("link", 0) == 0)
         {
             cidr = addr;
             break;
@@ -1124,7 +1128,7 @@ std::string first_global_ipv4(const std::string & nic)
     return cidr;
 }
 
-/// 把网卡全局 IPv4 重排为 cam_addr_cidr 在首位, 其余地址按原顺序跟后
+/// 把网卡可持久化的全局 IPv4 重排为 cam_addr_cidr 在首位, 其余地址按原顺序跟后
 /// (保留的原地址通过 kept_out 带出, 供 NM 持久化写回同一顺序)。
 /// GxGVTL 实测以网卡"首地址"为控制通道源地址: 相机网段地址不在首位时,
 /// 即使同网卡已配同段地址, open 仍超时(-14)——已在本机(6.8 内核)复现。
@@ -1149,12 +1153,11 @@ bool reorder_nic_addresses_first(const std::string & nic,
         }
         pclose(fp);
     }
-    // 169.254/16 被内核默认标成 scope link; NM 也如此。GxGVTL 只认
-    // 全局 IPv4 作控制源, 必须先删掉 link 副本再以 scope global 加回。
+    // 169.254/16 按内核规则是 scope link；这是合法的 GigE 相机控制源。
+    // 不强行写 scope global（iproute2/内核会拒绝该组合）。
     std::string cmd = "sudo ip addr del " + cam_addr_cidr + " dev " + nic +
         " >/dev/null 2>&1; sudo ip -4 addr flush dev " + nic + " scope global";
-    cmd += " && sudo ip addr add " + cam_addr_cidr + " dev " + nic +
-        " scope global";
+    cmd += " && sudo ip addr add " + cam_addr_cidr + " dev " + nic;
     for (const auto & a : keep)
     {
         cmd += " && sudo ip addr add " + a + " dev " + nic;
@@ -1253,8 +1256,8 @@ bool persist_addresses_nm(const std::string & nic,
     return true;
 }
 
-/// NM 会把 169.254/16 写成 scope link, 重启/reapply 后又不是全局首地址。
-/// 用 dispatcher 在该网口 up/reapply 后再强制一次, 不影响扩展坞 USB。
+/// NM 会重排地址；用 dispatcher 在该网口 up/reapply 后恢复相机网段
+/// 地址在前。169.254/16 保持内核要求的 scope link，不伪造为 global。
 bool install_gige_nm_dispatcher(const std::string & nic,
                                 const std::string & cam_addr_cidr,
                                 const std::vector<std::string> & rest_addrs)
@@ -1268,13 +1271,13 @@ bool install_gige_nm_dispatcher(const std::string & nic,
         return false;
     }
     out << "#!/bin/bash\n"
-        << "# JBGS: 相机网段地址必须是该网口首个全局 IPv4 (GxGVTL)\n"
+        << "# JBGS: 相机网段地址必须是该网口首个可用 IPv4 (GxGVTL)\n"
         << "IFACE=\"$1\"\nACTION=\"$2\"\n"
         << "[ \"$IFACE\" = \"" << nic << "\" ] || exit 0\n"
         << "case \"$ACTION\" in up|reapply|dhcp4-change) ;; *) exit 0 ;; esac\n"
         << "ip addr del " << cam_addr_cidr << " dev \"$IFACE\" >/dev/null 2>&1 || true\n"
         << "ip -4 addr flush dev \"$IFACE\" scope global\n"
-        << "ip addr add " << cam_addr_cidr << " dev \"$IFACE\" scope global\n";
+        << "ip addr add " << cam_addr_cidr << " dev \"$IFACE\"\n";
     for (const auto & a : rest_addrs)
     {
         out << "ip addr add " << a << " dev \"$IFACE\"\n";
@@ -1290,7 +1293,7 @@ bool install_gige_nm_dispatcher(const std::string & nic,
         return false;
     }
     std::cout << "  [已持久化] NM dispatcher " << name
-              << " (重启后仍把相机地址强制为全局首位, 保留 mid360)"
+              << " (重启后仍把相机地址恢复为首地址, 保留 mid360)"
               << std::endl;
     return true;
 }
@@ -1347,22 +1350,22 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
                      " gro off 2>/dev/null").c_str());
     }
 
-    // ---- 3. 控制通道就绪: 相机网段地址必须是该网卡"首个全局 IPv4" ----
+    // ---- 3. 控制通道就绪: 相机网段地址必须是该网卡首个可用 IPv4 ----
     // GxGVTL 以网卡首地址为控制源(本机实测: 同网卡挂着 192.168.1.50 在
     // 首位时两台相机 open 全部超时, 相机地址调到首位后立即恢复)。
-    // 169.254 还必须是 scope global: NM 常把它写成 link-local, 不算全局。
-    auto cam_is_first_global = [&]()
+    // 169.254 的 scope link 是内核标准行为，实机可正常枚举与取流。
+    auto cam_is_first_control_address = [&]()
     {
-        const std::string now = first_global_ipv4(camera_nic);
+        const std::string now = first_gige_control_ipv4(camera_nic);
         return !now.empty() &&
             cam_subnet(now) == cam_subnet(cams.front().ip);
     };
-    const std::string primary = first_global_ipv4(camera_nic);
-    if (!cam_is_first_global())
+    const std::string primary = first_gige_control_ipv4(camera_nic);
+    if (!cam_is_first_control_address())
     {
         if (primary.empty())
         {
-            std::cout << "  [诊断] " << camera_nic << " 没有全局 IPv4;"
+            std::cout << "  [诊断] " << camera_nic << " 没有可用 IPv4;"
                          " 相机在 " << cam_subnet(cams.front().ip)
                       << ".x 段, open 会超时(-14)" << std::endl;
         }
@@ -1382,15 +1385,15 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
         if (!primary.empty())
         {
             std::cout << "  [说明] 修复会把 " << cam_addr << " 调到该网卡"
-                         "全局首地址, 其余地址(如 mid360 的 " << primary
+                         "首地址, 其余地址(如 mid360 的 " << primary
                       << ")原序跟后; 期间同网卡设备闪断约 1 秒" << std::endl;
         }
         if (!auto_fix && !ask_yes("  是否自动修复(需要 sudo 密码)?", true))
         {
             std::cout << "  [提示] 手动修复命令:" << std::endl;
             std::cout << "      sudo ip addr add " << cam_addr << " dev "
-                      << camera_nic << " scope global"
-                      << "  # 必须排在该网卡全局地址列表首位" << std::endl;
+                      << camera_nic
+                      << "  # 必须排在该网卡 IPv4 地址列表首位" << std::endl;
             ++(*failures);
             return false;
         }
@@ -1413,13 +1416,13 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
             return false;
         }
         std::cout << "  [已修复] " << cam_addr << " 已是 " << camera_nic
-                  << " 全局首地址" << std::endl;
+                  << " 首个可用地址" << std::endl;
         persist_addresses_nm(camera_nic, cam_addr, kept, want_mtu);
-        // NM reapply 常把 169.254 改回 scope link, 再强制一次内核顺序。
-        if (!cam_is_first_global())
+        // NM reapply 可能重排地址，再强制一次地址顺序。
+        if (!cam_is_first_control_address())
         {
-            std::cout << "  [提示] NM 把 169.254 写成了 link-local, "
-                         "再强制为全局首地址" << std::endl;
+            std::cout << "  [提示] NM 重排了相机网段地址, 再恢复首地址"
+                      << std::endl;
             if (!reorder_nic_addresses_first(camera_nic, cam_addr, nullptr))
             {
                 std::cout << "  [错误] 修复后首地址仍不匹配, 放弃"
@@ -1428,7 +1431,7 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
                 return false;
             }
         }
-        if (!cam_is_first_global())
+        if (!cam_is_first_control_address())
         {
             std::cout << "  [错误] 修复后首地址仍不匹配, 放弃" << std::endl;
             ++(*failures);
@@ -1442,7 +1445,7 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
     }
     else
     {
-        std::cout << "  [网段] 已就绪: " << camera_nic << " 首个全局地址 "
+        std::cout << "  [网段] 已就绪: " << camera_nic << " 首个可用地址 "
                   << primary << " 覆盖相机网段" << std::endl;
         if (!check_only)
         {
@@ -1455,7 +1458,7 @@ bool ensure_gige_subnet(const std::vector<DeviceInfo> & cams,
                 }
             }
             persist_addresses_nm(camera_nic, cam_addr, rest, want_mtu);
-            if (!cam_is_first_global())
+            if (!cam_is_first_control_address())
             {
                 reorder_nic_addresses_first(camera_nic, cam_addr, nullptr);
             }
@@ -1772,6 +1775,14 @@ DualProbeResult probe_dual_stream(
             }
         });
     }
+    // 两台相机刚切换软触发时，首批 GVSP 包会受到设备端配置生效、USB
+    // 网卡 RX 队列建链的影响。它们不代表稳态带宽；先预热再清零计数，
+    // 否则 --check 会把随后 35/35 完整帧的 12fps 误报为不稳定。
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    complete0.store(0);
+    complete1.store(0);
+    incomplete0.store(0);
+    incomplete1.store(0);
     std::this_thread::sleep_for(std::chrono::seconds(seconds));
     running.store(false);
     for (int i = 0; i < 2; ++i)

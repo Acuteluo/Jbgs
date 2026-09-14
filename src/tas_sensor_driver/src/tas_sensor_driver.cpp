@@ -193,7 +193,10 @@ bool TasSensorDriver::openSerial()
 
     struct termios tio;
     std::memset(&tio, 0, sizeof(tio));
-    cfmakeraw(&tio);   // 原始模式(8 数据位, 无校验, 1 停止位, 置 CLOCAL|CREAD)
+    cfmakeraw(&tio);   // 原始模式(8 数据位, 无校验, 1 停止位)
+    // cfmakeraw 不保证置 CLOCAL/CREAD；尤其由 memset 初始化 termios 时，
+    // 未显式置 CREAD 会让 USB-RS485 出现“端口已打开但始终收不到应答”。
+    tio.c_cflag |= CLOCAL | CREAD;
 
     const speed_t speed = baudToTermios(baud_rate_);
     cfsetispeed(&tio, speed);
