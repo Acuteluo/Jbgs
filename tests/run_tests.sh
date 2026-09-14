@@ -28,13 +28,13 @@ FILTER="${1:-}"
 
 echo "[run_tests] 工程根: $PROJECT_ROOT"
 
-# ---- 1. ROS2 环境 ----
-if [ ! -f /opt/ros/humble/setup.bash ]; then
-    echo "[run_tests] 错误: 未找到 ROS2 Humble" >&2
-    exit 1
-fi
+# ---- 1. ROS2 环境(env.sh 会 conda deactivate, 禁止在虚拟环境里测) ----
+# shellcheck disable=SC1091
 set +u
-source /opt/ros/humble/setup.bash
+source "$PROJECT_ROOT/env/env.sh" || {
+    echo "[run_tests] 错误: 环境装载失败" >&2
+    exit 1
+}
 set -u
 
 # install 缺失时先引导构建(ctest 的 01_clean_build 仍会做正式干净重建)

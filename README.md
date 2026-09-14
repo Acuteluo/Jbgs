@@ -15,6 +15,44 @@ DG-202603 涵洞巡检赛题感知系统：双大恒相机（左/右）+ 红外�
 - launch 参数透传：`./run.sh sim:=false`、`./run.sh show_windows:=false in_trulyworking:=false` 等。
 - 无图形环境（无 DISPLAY）时同屏窗口自动强制关闭，不会崩溃。
 
+## 新机开箱配置（camera_setup_wizard）
+
+新机/换机/更换任一相机后，只需运行一次交互向导，无需手工配 IP/网口/JSON：
+
+```bash
+cd <工程根> && source env/env.sh
+ros2 run galaxy_camera_dual camera_setup_wizard          # 交互式配置
+ros2 run galaxy_camera_dual camera_setup_wizard --check  # 只检查不写入(验收)
+ros2 run galaxy_camera_dual camera_setup_wizard --tune-fps  # 只测/写帧率(换口后)
+```
+
+构建、启动、测试前必须退出 conda/venv（`env.sh` 会自动 `conda deactivate`）。向导里 sudo 密码只用于网络配置，不落盘。
+
+向导自动完成：
+
+1. **枚举大恒 GigE 相机**（跨网段广播）。优先按 SDK 报告的网卡 MAC 反查所在网口；若该口无载波（交换机已从扩展坞网口改插板载），则忽略坞以太网、改用有载波的同网段网口。红外/传感器仍可走坞上 USB。
+2. **网络自动修复**：GxGVTL 以网卡**首个全局 IPv4** 为控制源。相机网段地址（LLA 时 `169.254.100.1/16`）必须是 `scope global` 且排首位，否则能枚举但 open 超时 -14。其余地址（如 mid360 的 `192.168.1.50/24`）原序保留（闪断约 1 秒），并写回 NM（manual + MTU 9000）。
+3. **突发容量核验**：USB2 坞用 MTU 1500；USB3/板载用 MTU 9000。RX ring 调到驱动上限（RTL8125B 上限 256，到顶只提示）。
+4. **双机带宽/帧率**：按真实链路（USB2 坞 / USB3 坞 / 板载直插）双机同时软触发测流，写入能稳跑的最高 `frame_rate_hz`。USB2 不够双 5MP 时**不写入残帧配置**，提示换口；板载千兆实测约 10 fps。换口后 `--tune-fps`。
+5. **左右相机绑定**：逐台全屏预览（窗口拿不到焦点时终端直接回车等效，SSH 可用；输入 s 回车=跳过），帧数 ≥5 才允许确认，防止把无流相机绑进配置。
+6. **红外确认**：逐个 /dev/video* 预览（等待热像开机 FFC 黑帧期，不强设分辨率）。
+7. **传感器确认**：对 /dev/ttyUSB*/ttyACM* 逐个 Modbus 实读温湿度/CO2。
+8. 确认结果写回三张设备 JSON（先备份 `.bak`）；全部确认后把 `launch.json` 的 `sim_mode` 置 false——存在未确认模块时保持不变，之后可再次运行向导补配。
+
+`--check` 模式全程只读：枚举 → 网段/首地址 → MTU/RX ring → 双相机 3 秒真实取流残帧计数，任何一项不合格都明确拒绝并给出原因（防"能枚举≠能取流"的假绿）。
+
+### 常见故障速查
+
+| 现象 | 向导表现 | 处置 |
+|---|---|---|
+| 相机未识别（枚举 0 台） | 打印排障清单（网线/PoE、网段、巨帧、防火墙）后以失败退出，不假成功 | 查网线与 PoE 供电；`ip -br addr` 看相机网口是否有地址；临时 `sudo ufw disable` 排除防火墙 |
+| 能枚举、open 超时 -14 | 诊断"首地址不在相机网段"，自动把相机网段地址调到网卡首位（其余地址保序、闪断 1 秒） | 手工修：`sudo ip addr add 169.254.100.1/16 dev <相机网卡>`，且该地址必须排网卡地址列表**首位** |
+| 预览 NO FRAME / 残帧 | `--check` 用双机残帧计数验收；向导按链路选包长 | 固定「恰好 5 张残帧然后断流」是 GXDQBuf 声明错误（已修）。RTL8125B ring 上限 256；板载直插稳 10fps |
+| USB 串口总打不开 | 提示 brltty / ModemManager 抢占 | `sudo systemctl mask --now brltty brltty-udev ModemManager` 后重插 USB |
+| 相机改接 USB 扩展坞（RTL8153） | 打印 USB2/USB3/板载类型；**坞必须插 USB3** | USB2 双 5MP 会打满总线，不写残帧配置。红外/传感器可继续走坞 USB；交换机改插板载后向导忽略坞上网口残留地址 |
+| SDK 报已拔掉的坞网口 | 提示无载波已忽略，改用板载有载波网口 | 清掉坞以太网残留 `169.254`/`192.168.1.50`，勿动 mid360 所在的活网口 |
+| 相机与 mid360 共用交换机/网卡 | 重排地址时 mid360 地址**原序保留**，仅闪断约 1 秒 | 无需处理；mid360 的静态地址属导航侧配置，不归向导管，重装系统后需手工补回 |
+
 ## 总配置 config/launch.json
 
 | 键 | 说明 | 默认 |
@@ -133,32 +171,24 @@ Culvert-Visual-Inspection-main/   红外参考工程(有 COLCON_IGNORE, 不参�
 
 ## 真机接入待办
 
-0. **推荐：先跑配置向导**（交互式，自动完成下面 1~3 的设备确认与写配置）：
-
-   ```bash
-   source install/setup.bash
-   ros2 run galaxy_camera_dual camera_setup_wizard          # 交互式
-   ros2 run galaxy_camera_dual camera_setup_wizard --check  # 只检查不写入
-   ```
-
-   向导流程：① 枚举大恒相机（失败打印网卡网段/MTU/防火墙/SDK 排障清单；检测到"相机网段与网卡不匹配"时可自动 sudo 修复，网卡无地址时可自举加 link-local 后重新枚举）；② 逐台**全屏预览**两台大恒，测试者按 ENTER 结束预览并回答是左侧还是右侧，序列号自动绑定进对应 JSON——**预览窗实时显示 fps，不足 5 帧时 ENTER 被禁用**（防止把无流相机绑进配置，ESC 可跳过）；③ 逐个 /dev/video 候选预览确认红外热像（USB 直插直用，无需配置），写入 infrared_camera.json；④ 对每个串口候选发 Modbus 读数并显示 ~6 秒实时温湿度/CO2，确认后写入 sensor_driver.yaml；⑤ 四模块全部确认后自动把 launch.json 的 `sim_mode` 置 false。被修改文件均备份为 `*.bak`。
-
-   **网卡名从哪里来**：`enx00e04c1e2b40` 这类名字由 systemd/udev 按"USB 网卡"规则自动生成——`en`(Ethernet) + `x`(MAC 寻址) + 该网卡 MAC 地址（`00:e0:4c:1e:2b:40`）。**每台电脑、每个 USB 网卡的名字都不同**，不要照抄文档。向导运行时会列出本机全部网卡名供选择；只有一块有线网卡时直接回车即可。
-
-1. （手动方式）相机 JSON 回填两台大恒的 serial_number（首次真机启动后从日志抄录），`sim_mode` 置 false（或 `./run.sh sim:=false`）。
-2. 红外 `config/infrared_camera.json` 填 device_path/device_index；确认 `/dev/video*` 权限。
-3. 传感器 `src/tas_sensor_driver/config/sensor_driver.yaml` 确认 ttyUSB 与 Modbus 地址；`sim_mode: false`。
-4. 标定后回填三相机内参（JSON intrinsics + 包内 camera_info yaml）。
-5. 检查网卡 MTU 与巨帧（camera JSON packet_size 8192 需 MTU≥9000 或改小）；同一交换机上如还有其他发流设备（如 Mid360 雷达），会计入上行带宽预算。
+0. **推荐：先跑配置向导**（见上文「新机开箱配置」；网卡名由 udev 生成、每台机器不同，不要照抄 `enx…`）。
+1. （手动方式）相机 JSON 回填两台大恒 serial_number，`sim_mode` 置 false（或 `./run.sh sim:=false`）。
+2. 红外 `config/infrared_camera.json` 填 device_path；本机热像为 `/dev/video0`（`/dev/video1` 多为 metadata，不是红外）。
+3. 传感器 yaml 确认 ttyUSB 与 Modbus 地址。
+4. 标定后回填三相机内参。
+5. 巨帧：`packet_size` 8192 需主机 MTU≥9000；与 Mid360 共用交换机时计入上行带宽。
 
 ## 已知限制
 
-- **真机验证状态（2026-09-13 首轮实测）**：
-  - ✓ 传感器：/dev/ttyUSB0 Modbus 实测通过（T/RH/CO2 实时数据、CRC 校验通过）
-  - ✓ 红外：/dev/video2 UVC 实测 25.0fps 稳定（原生 256×192）
-  - ✓ 双大恒：枚举/打开/软触发全通；**GVSP 流量仍有丢包**（千兆链路下仅 1-6fps + 残帧），与包大小/帧率/限速/雷达无关，疑似交换机端口或 RTL8153 USB 网卡对连续巨帧突发的丢包，待物理层排查（换直连/换线/换端口对照）
-  - ✓ 配置向导：真机端到端跑通（网段自举修复 → 枚举 → 预览绑定左右 → 红外确认 → 传感器确认 → 自动写配置并切 sim_mode=false）
-  - 注意：双大恒 20fps×2 台共 192MB/s 超千兆线速，真机建议在两台 JSON 里把 frame_rate_hz 降到 8 左右
+- **真机验证状态（2026-09-14 板载直插）**：
+  - ✓ 双大恒：交换机上联板载 `enp45s0`（RTL8125 / r8169），向导写入 **10 fps** / 包长 8192 / MTU 9000；`./run.sh sim:=false` 左右各 10 Hz
+  - ✓ 红外：UVC `/dev/video0` 约 25 fps（原生 256×192）；可与传感器一起走扩展坞 USB
+  - ✓ 配置向导：认板载口、忽略已拔线坞网口残留地址、169.254 全局首位并保留 mid360 `192.168.1.50`
+  - ✓ 取流：旧版手写 `GXDQBuf`/`GXQBuf` 声明错误会导致「恰好 5 张残帧然后断流」，已按官方签名修正
+  - ⚠ 传感器：真机启动时 `/dev/ttyUSB0` 仍可能问询超时（驱动已起，数据无效），需再确认接线/向导
+  - ⚠ YOLO：本机 OpenCV 4.5.4 无法加载当前 onnx，左右视觉降级透传
+  - 注意：双 5MP 满帧约 20fps×2 超千兆，不要把 JSON 帧率抬到向导测稳值以上
+- **conda/venv**：禁止在虚拟环境里 `colcon` / `./run.sh` / 测试；`env.sh` 会自动 deactivate
 - 巡检"t 后第 2 帧"以巡检节点**到达顺序**为准；DDS 传输有毫秒级延迟，测试用静默间隔消除边界歧义。
 - 保存中的 0x01 用 try_lock 拒绝（不排队）；周期结束后再来的 0x01 视为新一轮巡检。
 - Release 构建类型未启用：-O3 会误报 galaxy SDK 封装的 stringop-overflow。

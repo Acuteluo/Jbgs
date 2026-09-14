@@ -2,7 +2,7 @@
 
 ## 工程事实
 
-- 工作目录：`/home/cly/Jbgs`（脚本一律从自身路径定位，禁止写死用户目录）。
+- 工作目录：仓库根（`run.sh` 所在目录；脚本一律从自身路径定位，禁止写死用户目录）。
 - 唯一入口：`./run.sh`（干净重建 + 启动）；`./run.sh --build-only` 只构建。
 - 构建：`colcon build --symlink-install`，默认构建类型（勿开 Release，见 README 已知限制）。
 - 启动：`ros2 launch bringup all.launch.py`，配置装载见 `src/bringup/launch/launch_common.py`（launch.json → 相机 JSON → yaml → launch 参数，优先级从低到高）。
@@ -34,6 +34,7 @@ colcon test --packages-select culvert_inspection     # 状态机单测
 
 ## 已知坑
 
+- **禁止在 conda/venv 里构建、启动、测试**（含 Cursor 助手）：ROS Humble 用系统 python3.10，conda python 会让 colcon 找不到 `catkin_pkg`/`em`。`env.sh` 会自动 `conda deactivate`；命令前仍应先退环境。
 - `set -u` 与 ROS setup.bash 冲突：source 前后用 `set +u / set -u` 包裹（run.sh、env.sh、测试脚本均已处理）。
 - launch 框架的 `launch_arguments` 必须传 `[(name, value)]` 元组列表，不能传 dict。
 - pkill -f 会匹配到执行它的命令块自身：清理进程用括号技巧（`nod[e]`）或精确可执行名。

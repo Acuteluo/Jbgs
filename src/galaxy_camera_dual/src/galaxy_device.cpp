@@ -14,10 +14,42 @@
 //    让上层节点走"失败计数 -> 自动重连"的正常恢复路径, 而不是崩溃。
 #include "galaxy_camera_dual/galaxy_device.hpp"
 
+#include <cstring>
 #include <vector>
 
 /// 判断 SDK 状态码是否成功(0 为成功, 其余为错误码)。
 #define GX_SUCCESS(X) (X == GX_STATUS_SUCCESS)
+
+// 队列取图(GXDQBuf/GXQBuf): 仓库携带的旧版 GxIAPI.h(1.1.1908)未声明,
+// 但 libgxiapi.so 已导出。官方签名是:
+//   GXDQBuf(handle, PGX_FRAME_BUFFER *ppBuf, uint32_t timeout)
+//   GXQBuf(handle, PGX_FRAME_BUFFER pBuf)
+// 曾误写成 GXDQBuf(handle, GX_FRAME_DATA*) / GXQBuf(handle)——SDK 内部
+// 5 个采集缓冲无法归还, 表现为"恰好 5 张残帧然后断流"(板载/扩展坞
+// 都复现)。为什么还要队列而不只用 GXGetImage: 扩展坞 USB2 网卡上
+// GXGetImage 一帧都取不到, 队列接口在两种链路上都能用(声明正确时)。
+typedef struct GX_FRAME_BUFFER
+{
+    GX_FRAME_STATUS nStatus;
+    void * pImgBuf;
+    int32_t nWidth;
+    int32_t nHeight;
+    int32_t nPixelFormat;
+    int32_t nImgSize;
+    uint64_t nFrameID;
+    uint64_t nTimestamp;
+    int32_t nBufID;
+    int32_t nOffsetX;
+    int32_t nOffsetY;
+    int32_t reserved[1];
+} GX_FRAME_BUFFER;
+typedef GX_FRAME_BUFFER * PGX_FRAME_BUFFER;
+
+extern "C" {
+GX_API GXDQBuf(GX_DEV_HANDLE hDevice, PGX_FRAME_BUFFER * ppFrameBuffer,
+               uint32_t nTimeOut);
+GX_API GXQBuf(GX_DEV_HANDLE hDevice, PGX_FRAME_BUFFER pFrameBuffer);
+}
 
 namespace galaxy_camera_dual
 {
@@ -158,6 +190,8 @@ std::vector<DeviceInfo> GalaxyDevice::listDevices(uint32_t timeout_ms)
             {
                 info.ip = ip_info.szIP;
                 info.mac = ip_info.szMAC;
+                info.nic_mac = ip_info.szNICMAC;
+                info.nic_ip = ip_info.szNICIP;
             }
             result.push_back(info);
         }
@@ -586,9 +620,32 @@ GX_STATUS GalaxyDevice::grab(GX_FRAME_DATA * frame_data, uint32_t timeout_ms)
 
     try
     {
-        // 相机掉线时 SDK 内部可能直接抛异常(实测 "send data failed"),
-        // 这里转成错误码返回, 让上层走失败重连路径。
-        return GXGetImage(h, frame_data, timeout_ms);
+        // 队列取图: GXDQBuf 返回 SDK 内部 GX_FRAME_BUFFER* -> 拷回调用方
+        // 缓冲 -> GXQBuf 必须带上该指针归还。残帧同样占用内部缓冲,
+        // DQBuf 成功后无论帧状态都要 QBuf, 否则队列枯竭后再也取不到帧。
+        // 相机掉线时 SDK 可能抛异常(实测 "send data failed"), 转成错误码。
+        PGX_FRAME_BUFFER queued = nullptr;
+        const GX_STATUS st = GXDQBuf(h, &queued, timeout_ms);
+        if (!GX_SUCCESS(st) || queued == nullptr)
+        {
+            // 队列失败时回退 GXGetImage(调用方已填 pImgBuf); 板载网口上可用。
+            return GXGetImage(h, frame_data, timeout_ms);
+        }
+        if (frame_data->pImgBuf != nullptr && queued->pImgBuf != nullptr &&
+            queued->nImgSize > 0)
+        {
+            std::memcpy(frame_data->pImgBuf, queued->pImgBuf,
+                        static_cast<size_t>(queued->nImgSize));
+        }
+        frame_data->nStatus = queued->nStatus;
+        frame_data->nImgSize = queued->nImgSize;
+        frame_data->nWidth = queued->nWidth;
+        frame_data->nHeight = queued->nHeight;
+        frame_data->nPixelFormat = queued->nPixelFormat;
+        frame_data->nFrameID = queued->nFrameID;
+        frame_data->nTimestamp = queued->nTimestamp;
+        GXQBuf(h, queued);
+        return GX_STATUS_SUCCESS;
     }
     catch (const std::exception &)
     {

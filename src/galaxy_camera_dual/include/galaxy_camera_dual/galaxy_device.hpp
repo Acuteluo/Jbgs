@@ -50,6 +50,8 @@ struct DeviceInfo
     std::string user_id;         ///< 用户自定义 ID
     std::string ip;              ///< IP 地址(仅 GigE 有效)
     std::string mac;             ///< MAC 地址(仅 GigE 有效)
+    std::string nic_mac;         ///< 相机应答所在主机网卡的 MAC(仅 GigE 有效)
+    std::string nic_ip;          ///< 该网卡当时的 IPv4(仅 GigE 有效)
 };
 
 /// 单台相机的线程安全封装。
