@@ -38,8 +38,8 @@ struct IrSeepageParams
     double min_area_px = 120.0;  ///< 小于该面积的连通域视为噪声
     double min_area_ratio = 0.3; ///< 相对最大连通域的面积比, 更小的碎轮廓丢掉
     // ---- 时间一致性(抗单帧误报) ----
-    int temporal_window = 5;     ///< 滑窗长度 N(帧); <=1 = 关闭(纯单帧检测)
-    int temporal_min_hits = 3;   ///< 窗口内至少命中帧数 M; 自动钳位到 <= N。
+    int temporal_window = 1;     ///< 滑窗长度 N(帧); <=1 = 关闭(参考工程单帧行为)
+    int temporal_min_hits = 1;   ///< 窗口内至少命中帧数 M; 自动钳位到 <= N。
                                  ///< 代价: 前 M-1 帧为预热期, 不输出区域
     bool enable_clahe = false;   ///< 低对比涵洞可打开以放大局部反差
     double clahe_clip = 2.0;

@@ -274,9 +274,10 @@ void IrSeepageDetector::drawOverlay(
             cv::drawContours(bgr, std::vector<std::vector<cv::Point>>{region.contour},
                              0, color, 2, cv::LINE_AA);
         }
-        std::string label = cv::format("dT=%.1f A=%.0f H=%.1f",
-                                       region.mean_diff, region.area_px,
-                                       region.mean_hits);
+        // 与红外参考工程保持一致，标签只表达局部差分和区域面积；
+        // 时间命中数保留在结果数据中用于诊断，不改变最终视觉效果。
+        std::string label = cv::format("dT=%.1f A=%.0f",
+                                       region.mean_diff, region.area_px);
         cv::Point text(region.bbox.x, std::max(region.bbox.y - 6, 14));
         cv::putText(bgr, label, text, cv::FONT_HERSHEY_SIMPLEX, 0.45,
                     cv::Scalar(0, 0, 0), 3);

@@ -70,6 +70,13 @@ constexpr const char * kWindowName = "culvert_monitor";
 /// 窗格顶部信息条高度(两行: 标题 + src/det 帧率; 全屏下清晰可读)。
 constexpr int kPaneHeaderHeight = 52;
 
+/// 总体面板顶部状态区: 传感器与导航各占一个同尺寸信息框；实时回传图
+/// 从本区域下方开始，状态框绝不覆盖三路画面。
+constexpr int kStatusBoxWidth = 600;
+constexpr int kStatusBoxHeight = 200;
+constexpr int kStatusBoxMargin = 6;
+constexpr int kTopStatusHeight = kStatusBoxHeight + 2 * kStatusBoxMargin;
+
 /// 等比适配到窗格: 图像缩放到"恰好装进"窗格(不变形), 居中放在深灰
 /// 底上。全屏模式下窗格为竖长条(与屏幕同宽高比), 相机 4:3 图像上下
 /// 留边属于预期布局。返回缩放系数与内容偏移, 供坐标映射(红外轮廓)。
@@ -103,6 +110,29 @@ void FitToPane(
     if (dy_out) { *dy_out = dy; }
 }
 
+/// 参考工程的红外显示基底: 显示局部高斯背景场而不是原始热像。
+/// 这会压掉机芯的绝对亮度/AGC 抖动，直观看到与渗水轮廓同一尺度的
+/// 温度背景；检测始终仍在原生灰度帧上完成，二者不相互影响。
+cv::Mat IrBackgroundView(const IrSeepageResult & result, const cv::Mat & fallback)
+{
+    if (!result.background.empty())
+    {
+        cv::Mat normalized;
+        cv::Mat bgr;
+        cv::normalize(result.background, normalized, 0, 255,
+                      cv::NORM_MINMAX, CV_8U);
+        cv::cvtColor(normalized, bgr, cv::COLOR_GRAY2BGR);
+        return bgr;
+    }
+    if (fallback.channels() == 1)
+    {
+        cv::Mat bgr;
+        cv::cvtColor(fallback, bgr, cv::COLOR_GRAY2BGR);
+        return bgr;
+    }
+    return fallback.clone();
+}
+
 /// 相对路径解析: 以 JBGS_ROOT 环境变量(run.sh 导出)为基准,
 /// 未设置时退化为进程 cwd。绝对路径原样返回。
 std::string ResolvePath(const std::string & path)
@@ -133,8 +163,8 @@ CoreNode::CoreNode()
     save_dir_ = ResolvePath(save_dir_);
     yolo_model_path_ = ResolvePath(yolo_model_path_);
 
-    // 全屏模式: 探测屏幕分辨率, 窗格高度按画布:屏幕 = 1:1 反推
-    // (画布宽 = 3*pane_w + 2*gap, 与屏幕同比 => 铺满无黑边)。
+    // 全屏模式: 顶部状态区固定保留，余下高度按画布与屏幕同比反推给三窗格，
+    // 使状态框与实时回传图同时完整落在屏幕内。
     if (fullscreen_)
     {
         int screen_w = 0;
@@ -168,14 +198,15 @@ CoreNode::CoreNode()
         }
         screen_w_ = screen_w;
         screen_h_ = screen_h;
-        pane_height_ = static_cast<int>(std::round(
+        pane_height_ = std::max(1, static_cast<int>(std::round(
             (3.0 * pane_width_ + 2.0 * pane_gap_) * screen_h /
-            static_cast<double>(screen_w)));
+            static_cast<double>(screen_w))) - kTopStatusHeight);
         RCLCPP_INFO(
             get_logger(),
-            "全屏展示: 屏幕 %dx%d, 画布 %dx%d (窗格 %dx%d, 图像等比留边)",
-            screen_w_, screen_h_, 3 * pane_width_ + 2 * pane_gap_,
-            pane_height_, pane_width_, pane_height_);
+            "全屏展示: 屏幕 %dx%d, 顶部状态区 %dpx, 回传区 %dx%d (窗格 %dx%d)",
+            screen_w_, screen_h_, kTopStatusHeight,
+            3 * pane_width_ + 2 * pane_gap_, pane_height_,
+            pane_width_, pane_height_);
     }
 
     // 2. 三路视频源上下文的静态信息(话题名等)
@@ -812,20 +843,16 @@ void CoreNode::IrDetectLoop()
                     std::chrono::steady_clock::now() - infer_start).count();
             const size_t n_regions = result.regions.size();
 
-            // 2) 原始帧放大到窗格尺寸, 检测结果(轮廓/外接框)按同比例
-            //    等比适配到窗格坐标后画框 —— 显示像素与标注一一对应
-            //    (等比缩放 + 居中偏移, 轮廓坐标按下式映射)。
+            // 2) 严格沿用参考工程的显示语义: 显示归一化的高斯背景场，
+            //    而非原始帧。检测轮廓仍来自原生分辨率，两者尺寸一致；
+            //    再统一等比适配到窗格，保证标注不会错位。
             double fit_scale = 1.0;
             int fit_dx = 0;
             int fit_dy = 0;
             cv::Mat pane_img;
-            FitToPane(frame, pane_width_, pane_height_, pane_img,
+            const cv::Mat display_source = IrBackgroundView(result, frame);
+            FitToPane(display_source, pane_width_, pane_height_, pane_img,
                       &fit_scale, &fit_dx, &fit_dy);
-            // 灰度帧转 BGR, 供画黄色轮廓
-            if (pane_img.channels() == 1)
-            {
-                cv::cvtColor(pane_img, pane_img, cv::COLOR_GRAY2BGR);
-            }
             for (auto & region : result.regions)
             {
                 region.bbox.x = static_cast<int>(
@@ -953,17 +980,18 @@ void CoreNode::DrawSensorOverlay(cv::Mat & canvas)
             cv::Scalar(120, 200, 255);           // 橙: 部分字段失效
     }
 
-    // 半透明黑底: 提高任何背景下的可读性。
-    // y 从 60 起(避开窗格顶部 52px 信息条), 大字号全屏可读。
-    const cv::Rect bg(6, 60, 600, 150);
+    // 顶部状态区左框: 与导航框严格同尺寸、同高度，且位于回传图区之外。
+    const int bg_x = kStatusBoxMargin;
+    const int bg_y = kStatusBoxMargin;
+    const cv::Rect bg(bg_x, bg_y, kStatusBoxWidth, kStatusBoxHeight);
     cv::Mat roi = canvas(bg);
     cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
     cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
     cv::rectangle(canvas, bg, color, 1, cv::LINE_AA);
 
-    cv::putText(canvas, line1, cv::Point(16, 112),
+    cv::putText(canvas, line1, cv::Point(bg_x + 10, bg_y + 52),
                 cv::FONT_HERSHEY_SIMPLEX, 0.88, color, 1, cv::LINE_AA);
-    cv::putText(canvas, line2, cv::Point(16, 162),
+    cv::putText(canvas, line2, cv::Point(bg_x + 10, bg_y + 108),
                 cv::FONT_HERSHEY_SIMPLEX, 0.75, color, 1, cv::LINE_AA);
 }
 
@@ -988,8 +1016,11 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
         color = cv::Scalar(60, 220, 220);     // 黄: 取图中
     }
 
-    // 半透明黑底(传感器块下方): 三行大字 —— 收到的指令 / 发出的状态 / 状态词
-    const cv::Rect bg(6, 224, 600, 200);
+    // 顶部状态区中框: 与左侧传感器框严格同尺寸、同高度；中间和右侧
+    // 实时回传图均从状态区下沿开始，因此不会被通信框遮挡。
+    const int bg_x = pane_width_ + pane_gap_ + kStatusBoxMargin;
+    const int bg_y = kStatusBoxMargin;
+    const cv::Rect bg(bg_x, bg_y, kStatusBoxWidth, kStatusBoxHeight);
     cv::Mat roi = canvas(bg);
     cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
     cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
@@ -999,11 +1030,11 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
     std::snprintf(l_nav, sizeof(l_nav), "NAV->VIS  0x%02X", cmd);
     char l_vis[64];
     std::snprintf(l_vis, sizeof(l_vis), "VIS->NAV  0x%02X", st);
-    cv::putText(canvas, l_nav, cv::Point(16, 268),
+    cv::putText(canvas, l_nav, cv::Point(bg_x + 10, bg_y + 44),
                 cv::FONT_HERSHEY_SIMPLEX, 0.88, color, 1, cv::LINE_AA);
-    cv::putText(canvas, l_vis, cv::Point(16, 322),
+    cv::putText(canvas, l_vis, cv::Point(bg_x + 10, bg_y + 98),
                 cv::FONT_HERSHEY_SIMPLEX, 0.88, color, 1, cv::LINE_AA);
-    cv::putText(canvas, state, cv::Point(16, 384),
+    cv::putText(canvas, state, cv::Point(bg_x + 10, bg_y + 160),
                 cv::FONT_HERSHEY_SIMPLEX, 0.72, color, 1, cv::LINE_AA);
 }
 
@@ -1059,7 +1090,7 @@ void CoreNode::DisplayLoop()
             }
 
             const int canvas_w = pane_width_ * 3 + pane_gap_ * 2;
-            const cv::Size canvas_size(canvas_w, pane_height_);
+            const cv::Size canvas_size(canvas_w, pane_height_ + kTopStatusHeight);
             cv::Mat canvas(canvas_size, CV_8UC3, cv::Scalar(40, 40, 40));
 
             // ---- 三个窗格: 左 | 右 | 红外 ----
@@ -1104,12 +1135,14 @@ void CoreNode::DisplayLoop()
 
                 if (!offline && !pane_img.empty())
                 {
-                    pane_img.copyTo(canvas(cv::Rect(x0, 0, pane_width_, pane_height_)));
+                    pane_img.copyTo(canvas(cv::Rect(
+                        x0, kTopStatusHeight, pane_width_, pane_height_)));
                 }
                 else
                 {
                     // 占位: 深灰底 + 离线提示(热插拔等待接入时的画面)
-                    cv::Mat cell = canvas(cv::Rect(x0, 0, pane_width_, pane_height_));
+                    cv::Mat cell = canvas(cv::Rect(
+                        x0, kTopStatusHeight, pane_width_, pane_height_));
                     cell.setTo(cv::Scalar(28, 28, 28));
                     const std::string tip = offline ?
                         stream.title + "  OFFLINE" :
@@ -1125,7 +1158,7 @@ void CoreNode::DisplayLoop()
                 }
             }
 
-            // ---- 传感器数据标注 + 导航协议状态(总图左上区域) ----
+            // ---- 顶部状态区: 左传感器、中导航；下方为三个实时回传图 ----
             DrawSensorOverlay(canvas);
             DrawNavOverlay(canvas);
 
@@ -1135,7 +1168,8 @@ void CoreNode::DisplayLoop()
             const int fps_w = cv::getTextSize(
                 fps_text, cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, nullptr).width;
             cv::putText(canvas, fps_text,
-                        cv::Point(canvas_w - fps_w - 8, pane_height_ - 8),
+                        cv::Point(canvas_w - fps_w - 8,
+                                  kTopStatusHeight + pane_height_ - 8),
                         cv::FONT_HERSHEY_SIMPLEX, 0.45,
                         cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
 
