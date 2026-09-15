@@ -45,8 +45,8 @@
         sim_image_dir: "pictures/light"
         camera_info_url: "package://galaxy_camera_dual/config/camera_info_left.yaml"
 
-        exposure_time: 5000.0    # 曝光时间, 单位 us, 可运行时在线修改
-        gain: 1.0              # 增益, 可运行时在线修改
+        exposure_time: 25000.0    # 曝光时间, 单位 us, 可运行时在线修改
+        gain: 2.0              # 增益, 可运行时在线修改
         # 单千兆上联下两台 5MP Bayer8 的安全目标值：8 Hz/台约 646 Mbps，
         # 留出 GVSP/DDS 开销；20 Hz/台约 1.61 Gbps，必然导致残帧。
         frame_rate: 8.0        # 双机目标采集帧率(Hz), 0 = 保持相机默认
@@ -70,8 +70,8 @@
         # 模拟模式: 右相机接入的另一批画面(valid 集, 与左不同)
         sim_image_dir: "pictures/dark"
         camera_info_url: "package://galaxy_camera_dual/config/camera_info_right.yaml"
-        exposure_time: 5000.0
-        gain: 1.0
+        exposure_time: 25000.0
+        gain: 2.0
         frame_rate: 8.0
         packet_size: 8192
         throughput_limit_bps: 55000000
