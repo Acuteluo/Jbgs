@@ -7,11 +7,11 @@
   "device_index": 0,
   "device_path": "/dev/video0",
 
-  "frame_rate_hz": 25.0,
+  "frame_rate_hz": 50.0,
   "frame_id": "ir_camera_optical_frame",
 
   "intrinsics": {
-    "_说明": "内参占位: 原生分辨率 256x192(勿放大后做渗水检测)",
+    "_说明": "内参占位: 本机热像芯 V4L2 仅 YUYV 256x192(已是硬件上限, 驱动按枚举最大值协商)",
     "resolution": [256, 192],
     "fx": 0.0, "fy": 0.0, "cx": 0.0, "cy": 0.0, "distortion_model": ""
   }

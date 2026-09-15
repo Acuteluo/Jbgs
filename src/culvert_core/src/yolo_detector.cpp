@@ -35,7 +35,10 @@ YoloDetector::YoloDetector(
 
     try
     {
-        // 2. 从 ONNX 加载网络结构与权重
+        // 2. 从 ONNX 加载网络结构与权重。
+        //    OpenCV 4.5.4 吃不了 Ultralytics 原版 YOLOv8 图(model.22/Add
+        //    parseBias 断言); 仓库内 onnx 须先经 scripts/make_opencv_onnx.py
+        //    做等价图变换, 输出张量布局不变。
         net_ = cv::dnn::readNetFromONNX(model_path);
 
         // 3. 选择推理引擎: CPU(OpenCV) 或 OpenVINO 加速
@@ -89,7 +92,9 @@ YoloDetector::YoloDetector(
             {
                 RCLCPP_ERROR(
                     rclcpp::get_logger("YoloDetector"),
-                    "[YOLO] CPU 回退也失败: %s", e2.what());
+                    "[YOLO] CPU 回退也失败: %s"
+                    " (OpenCV 4.5.4 需先运行 scripts/make_opencv_onnx.py 转换该 onnx)",
+                    e2.what());
                 is_ready_ = false;
             }
         }
@@ -97,7 +102,9 @@ YoloDetector::YoloDetector(
         {
             RCLCPP_ERROR(
                 rclcpp::get_logger("YoloDetector"),
-                "[YOLO] DNN 初始化异常: %s", e.what());
+                "[YOLO] DNN 初始化异常: %s"
+                " (OpenCV 4.5.4 需先运行 scripts/make_opencv_onnx.py 转换该 onnx)",
+                e.what());
             is_ready_ = false;
         }
     }

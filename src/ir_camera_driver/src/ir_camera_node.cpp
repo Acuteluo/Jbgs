@@ -26,10 +26,15 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fcntl.h>
+#include <linux/videodev2.h>
 #include <string>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #include <vector>
 
 namespace ir_camera_driver
@@ -45,6 +50,165 @@ constexpr int kWaitingLogThrottleMs = 15000;
 
 /// 健康报告间隔(秒)。
 constexpr double kHealthReportSec = 30.0;
+
+/// V4L2 离散模式: 分辨率 + 帧率 + 像素格式。
+struct V4lMode
+{
+    int width = 0;
+    int height = 0;
+    double fps = 0.0;
+    uint32_t pixelformat = 0;
+};
+
+std::string FourccName(uint32_t fourcc)
+{
+    char s[5] = {
+        static_cast<char>(fourcc & 0xFF),
+        static_cast<char>((fourcc >> 8) & 0xFF),
+        static_cast<char>((fourcc >> 16) & 0xFF),
+        static_cast<char>((fourcc >> 24) & 0xFF),
+        0};
+    return s;
+}
+
+/// 热像优先无损格式: 灰度/YUYV 放大后比 MJPG 更清晰。
+int PixelFormatRank(uint32_t fmt)
+{
+    switch (fmt)
+    {
+        case V4L2_PIX_FMT_GREY: return 4;
+        case V4L2_PIX_FMT_YUYV: return 3;
+        case V4L2_PIX_FMT_UYVY: return 3;
+        case V4L2_PIX_FMT_NV12: return 2;
+        case V4L2_PIX_FMT_MJPEG: return 1;
+        default: return 0;
+    }
+}
+
+bool BetterMode(const V4lMode & a, const V4lMode & b)
+{
+    const int pa = a.width * a.height;
+    const int pb = b.width * b.height;
+    if (pa != pb)
+    {
+        return pa > pb;
+    }
+    if (PixelFormatRank(a.pixelformat) != PixelFormatRank(b.pixelformat))
+    {
+        return PixelFormatRank(a.pixelformat) > PixelFormatRank(b.pixelformat);
+    }
+    return a.fps > b.fps;
+}
+
+double MaxFpsForSize(int fd, uint32_t pixelformat, int width, int height)
+{
+    v4l2_frmivalenum ival{};
+    ival.pixel_format = pixelformat;
+    ival.width = static_cast<uint32_t>(width);
+    ival.height = static_cast<uint32_t>(height);
+    double best = 0.0;
+    for (ival.index = 0; ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &ival) == 0;
+         ++ival.index)
+    {
+        double fps = 0.0;
+        if (ival.type == V4L2_FRMIVAL_TYPE_DISCRETE &&
+            ival.discrete.numerator > 0)
+        {
+            fps = static_cast<double>(ival.discrete.denominator) /
+                  static_cast<double>(ival.discrete.numerator);
+        }
+        else if ((ival.type == V4L2_FRMIVAL_TYPE_STEPWISE ||
+                  ival.type == V4L2_FRMIVAL_TYPE_CONTINUOUS) &&
+                 ival.stepwise.min.numerator > 0)
+        {
+            // min 间隔 = 最高帧率
+            fps = static_cast<double>(ival.stepwise.min.denominator) /
+                  static_cast<double>(ival.stepwise.min.numerator);
+        }
+        best = std::max(best, fps);
+    }
+    return best;
+}
+
+void AddSize(
+    int fd, uint32_t pixelformat, int width, int height,
+    std::vector<V4lMode> & modes)
+{
+    if (width < 16 || height < 16)
+    {
+        return;
+    }
+    V4lMode m;
+    m.width = width;
+    m.height = height;
+    m.pixelformat = pixelformat;
+    m.fps = MaxFpsForSize(fd, pixelformat, width, height);
+    modes.push_back(m);
+}
+
+/// 枚举设备全部离散/步进尺寸, 选出"像素最多、其次无损格式、再其次最高帧率"。
+bool PickMaxV4lMode(const std::string & path, V4lMode & best, std::string & err)
+{
+    const int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK);
+    if (fd < 0)
+    {
+        err = std::string("open 失败: ") + std::strerror(errno);
+        return false;
+    }
+
+    std::vector<V4lMode> modes;
+    v4l2_fmtdesc fmt{};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    for (fmt.index = 0; ioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0; ++fmt.index)
+    {
+        v4l2_frmsizeenum fsize{};
+        fsize.pixel_format = fmt.pixelformat;
+        for (fsize.index = 0; ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &fsize) == 0;
+             ++fsize.index)
+        {
+            if (fsize.type == V4L2_FRMSIZE_TYPE_DISCRETE)
+            {
+                AddSize(
+                    fd, fmt.pixelformat,
+                    static_cast<int>(fsize.discrete.width),
+                    static_cast<int>(fsize.discrete.height), modes);
+            }
+            else if (fsize.type == V4L2_FRMSIZE_TYPE_STEPWISE ||
+                     fsize.type == V4L2_FRMSIZE_TYPE_CONTINUOUS)
+            {
+                AddSize(
+                    fd, fmt.pixelformat,
+                    static_cast<int>(fsize.stepwise.max_width),
+                    static_cast<int>(fsize.stepwise.max_height), modes);
+            }
+        }
+    }
+    ::close(fd);
+
+    if (modes.empty())
+    {
+        err = "未枚举到任何采集尺寸";
+        return false;
+    }
+    best = modes.front();
+    for (const auto & m : modes)
+    {
+        if (BetterMode(m, best))
+        {
+            best = m;
+        }
+    }
+    return true;
+}
+
+std::string DevicePathOf(const std::string & device_path, int device_index)
+{
+    if (!device_path.empty())
+    {
+        return device_path;
+    }
+    return "/dev/video" + std::to_string(device_index);
+}
 }  // namespace
 
 // ============================== 构造/析构 ==============================
@@ -84,11 +248,11 @@ void IrCameraNode::initParams()
     topic_base_ = declare_parameter<std::string>("topic_base", "/ir_camera/image_raw");
     device_index_ = declare_parameter<int>("device_index", 0);
     device_path_ = declare_parameter<std::string>("device_path", "");
-    frame_rate_ = declare_parameter<double>("frame_rate", 25.0);
+    frame_rate_ = declare_parameter<double>("frame_rate", 50.0);
     grab_fail_limit_ = declare_parameter<int>("grab_fail_limit", 10);
     use_sensor_data_qos_ = declare_parameter<bool>("use_sensor_data_qos", true);
     frame_id_ = declare_parameter<std::string>("frame_id", "ir_camera_optical_frame");
-    jpeg_quality_ = static_cast<int>(declare_parameter<int>("jpeg_quality", 80));
+    jpeg_quality_ = static_cast<int>(declare_parameter<int>("jpeg_quality", 95));
 
     // ---- 模拟模式参数(与 galaxy_camera_dual 同构) ----
     sim_mode_ = declare_parameter<bool>("sim_mode", true);
@@ -205,18 +369,58 @@ bool IrCameraNode::tryOpenDevice()
     return true;
     }
 
-    // 真机: 优先用路径(如 /dev/video2), 否则用 V4L2 序号
+    // 真机: 优先用路径(如 /dev/video2), 否则用 V4L2 序号。
+    // 打开后按设备能力拉到最大离散分辨率(本机热像芯实测仅 YUYV 256x192
+    // @25/50fps; 切勿盲设 640x512, 会协商失败或得到拉伸糊图)。
     cap_.release();
-    const bool ok = !device_path_.empty() ?
-        cap_.open(device_path_, cv::CAP_V4L2) :
-        cap_.open(device_index_, cv::CAP_V4L2);
+    const std::string path = DevicePathOf(device_path_, device_index_);
+
+    // 先枚举再 open: UVC 设备常独占, 打开后无法再 ioctl 枚举。
+    V4lMode mode;
+    std::string enum_err;
+    const bool have_mode = PickMaxV4lMode(path, mode, enum_err);
+
+    const bool ok = cap_.open(path, cv::CAP_V4L2);
     if (!ok)
     {
         return false;
     }
-    // MJPG 请求: 多数 UVC 机芯在 MJPG 下才能跑满帧率; 失败也无妨
-    // (机芯不支持时 OpenCV 保持默认 YUYV, 帧率可能受限)。
-    cap_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+
+    if (have_mode)
+    {
+        cap_.set(
+            cv::CAP_PROP_FOURCC,
+            static_cast<double>(mode.pixelformat));
+        cap_.set(cv::CAP_PROP_FRAME_WIDTH, mode.width);
+        cap_.set(cv::CAP_PROP_FRAME_HEIGHT, mode.height);
+        if (mode.fps > 0.0)
+        {
+            cap_.set(cv::CAP_PROP_FPS, mode.fps);
+        }
+        const int got_w = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_WIDTH));
+        const int got_h = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_HEIGHT));
+        const double got_fps = cap_.get(cv::CAP_PROP_FPS);
+        const uint32_t got_fcc = static_cast<uint32_t>(
+            cap_.get(cv::CAP_PROP_FOURCC));
+        RCLCPP_INFO(
+            get_logger(),
+            "红外协商格式: 请求 %s %dx%d @ %.1ffps, 实际 %s %dx%d @ %.1ffps",
+            FourccName(mode.pixelformat).c_str(), mode.width, mode.height,
+            mode.fps, FourccName(got_fcc).c_str(), got_w, got_h, got_fps);
+        if (got_w * got_h < mode.width * mode.height)
+        {
+            RCLCPP_WARN(
+                get_logger(),
+                "红外实际分辨率低于设备枚举最大值, 画面会被放大变糊");
+        }
+    }
+    else
+    {
+        RCLCPP_WARN(
+            get_logger(),
+            "红外未能枚举 V4L2 尺寸(%s), 沿用驱动默认格式", enum_err.c_str());
+    }
+
     frame_counter_ = 0;
     next_frame_time_ = std::chrono::steady_clock::now();
     next_publish_time_ = std::chrono::steady_clock::now();
@@ -275,6 +479,15 @@ bool IrCameraNode::grabGrayFrame(cv::Mat & gray)
     else
     {
         frame.convertTo(gray, CV_8UC1);
+    }
+    static bool logged_size = false;
+    if (!logged_size)
+    {
+        logged_size = true;
+        RCLCPP_INFO(
+            get_logger(),
+            "红外实到帧 %dx%d channels=%d (机芯硬件上限, 同屏按此上采样)",
+            gray.cols, gray.rows, gray.channels());
     }
     return true;
 }

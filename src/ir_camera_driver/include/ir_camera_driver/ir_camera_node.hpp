@@ -108,7 +108,7 @@ private:
     std::string topic_base_ = "/ir_camera/image_raw";  ///< 话题基名
     int device_index_ = 0;         ///< 真机: V4L2 设备序号(/dev/videoN 的 N)
     std::string device_path_;      ///< 真机: 设备路径(非空时优先于序号)
-    double frame_rate_ = 25.0;     ///< 发布帧率上限(Hz); <=0 = 跟随设备
+    double frame_rate_ = 50.0;     ///< 发布帧率上限(Hz); <=0 = 跟随设备
     int grab_fail_limit_ = 10;     ///< 连续失败多少次判定离线(触发热插拔恢复)
     bool use_sensor_data_qos_ = true;  ///< 发布 QoS(与订阅端 core_node 对齐)
     std::string frame_id_ = "ir_camera_optical_frame";  ///< 图像 frame_id
@@ -144,7 +144,7 @@ private:
     uint64_t frame_counter_ = 0;   ///< 已发布帧号(叠加在模拟画面上)
     // JPEG 质量: 参数回调线程可在线修改、采集线程读取 —— 跨线程,
     // 必须用原子类型(普通 int 的并发读写是数据竞争)。
-    std::atomic<int> jpeg_quality_{80};  ///< JPEG 质量(1-100)
+    std::atomic<int> jpeg_quality_{95};  ///< JPEG 质量(1-100)
 };
 
 }  // namespace ir_camera_driver

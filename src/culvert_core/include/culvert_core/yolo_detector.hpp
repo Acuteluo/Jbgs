@@ -17,6 +17,10 @@
 //
 // 两种模型都用 letterbox 预处理(等比缩放+灰边), 与训练完全一致。
 // 支持 CPU / GPU(OpenVINO) 双模式, 若 GPU 不可用自动回退 CPU。
+//
+// OpenCV 4.5.4: 仓库 models/crack_*_best.onnx 已按
+// scripts/make_opencv_onnx.py 做过等价图变换(折叠动态 chunk、
+// 把 stride 乘改到 channel 轴), 输出仍是 [1,5|37,8400](+/proto)。
 
 #pragma once
 

@@ -8,9 +8,9 @@ ir_camera_driver:
     # ---- 真机(UVC)参数 ----
     device_index: 0          # /dev/videoN 的 N(机芯通常枚举为后插入的序号)
     device_path: ""          # 直接给路径(如 /dev/video2)时优先于序号
-    frame_rate: 25.0         # 发布帧率上限(Hz), 0 = 跟随机芯
+    frame_rate: 50.0         # 发布帧率上限(Hz), 0 = 跟随机芯; 本机芯最高 50
     grab_fail_limit: 10      # 连续失败次数上限, 超过判定离线并进入热插拔恢复
-    jpeg_quality: 80
+    jpeg_quality: 95         # 256x192 放大显示时 80 会出块效应
     use_sensor_data_qos: true
 
     # ---- 热插拔模拟(无实体机芯时置 true; 插拔语义与真机一致) ----

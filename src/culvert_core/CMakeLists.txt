@@ -100,6 +100,22 @@ if(BUILD_TESTING)
         ${OpenCV_INCLUDE_DIRS}
     )
     target_link_libraries(test_ir_seepage_detector ${OpenCV_LIBRARIES})
+
+    # ---- YOLO 加载/推理回归: OpenCV 4.5.4 必须能加载仓库内 onnx ----
+    ament_add_gtest(test_yolo_detector
+        test/test_yolo_detector.cpp
+        src/yolo_detector.cpp
+    )
+    target_include_directories(test_yolo_detector PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    ament_target_dependencies(test_yolo_detector rclcpp)
+    target_link_libraries(test_yolo_detector ${OpenCV_LIBRARIES})
+    # 包在 src/culvert_core, 工程根是再上两级; 与 run.sh 的 JBGS_ROOT 一致
+    get_filename_component(_jbgs_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set_tests_properties(test_yolo_detector PROPERTIES
+        ENVIRONMENT "JBGS_ROOT=${_jbgs_root};ROS_DOMAIN_ID=93")
 endif()
 
 ament_package()

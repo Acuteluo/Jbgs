@@ -30,6 +30,7 @@
       enable_right: true
       # seg = 框+分割掩膜描边(默认); detect = 仅矩形框
       model_type: seg
+      # 须为经 scripts/make_opencv_onnx.py 处理过的图(OpenCV 4.5.4 DNN)
       model_path: models/crack_seg_best.onnx
       # detect 模型: models/crack_best.onnx
       use_gpu: false          # OpenCV CPU 已验证稳定; OpenVINO GPU 输出异常

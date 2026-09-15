@@ -85,7 +85,8 @@ constexpr int kPaneHeaderHeight = 52;
 /// 留边属于预期布局。返回缩放系数与内容偏移, 供坐标映射(红外轮廓)。
 void FitToPane(
     const cv::Mat & src, int pane_w, int pane_h, cv::Mat & dst,
-    double * scale_out = nullptr, int * dx_out = nullptr, int * dy_out = nullptr)
+    double * scale_out = nullptr, int * dx_out = nullptr, int * dy_out = nullptr,
+    int upscale_interp = cv::INTER_LINEAR)
 {
     dst = cv::Mat(pane_h, pane_w, CV_8UC3, cv::Scalar(28, 28, 28));
     if (src.empty())
@@ -104,7 +105,7 @@ void FitToPane(
         1, static_cast<int>(std::round(src.rows * s)));
     cv::Mat fitted;
     cv::resize(src, fitted, cv::Size(fitted_w, fitted_h),
-               0.0, 0.0, s < 1.0 ? cv::INTER_AREA : cv::INTER_LINEAR);
+               0.0, 0.0, s < 1.0 ? cv::INTER_AREA : upscale_interp);
     const int dx = (pane_w - fitted_w) / 2;
     const int dy = (pane_h - fitted_h) / 2;
     fitted.copyTo(dst(cv::Rect(dx, dy, fitted_w, fitted_h)));
@@ -113,27 +114,24 @@ void FitToPane(
     if (dy_out) { *dy_out = dy; }
 }
 
-/// 参考工程的红外显示基底: 显示局部高斯背景场而不是原始热像。
-/// 这会压掉机芯的绝对亮度/AGC 抖动，直观看到与渗水轮廓同一尺度的
-/// 温度背景；检测始终仍在原生灰度帧上完成，二者不相互影响。
-cv::Mat IrBackgroundView(const IrSeepageResult & result, const cv::Mat & fallback)
+/// 红外同屏用伪彩热量图: 灰度拉满 0~255 后套 INFERNO(暗冷/亮热)。
+/// 只用于显示, 渗水检测仍吃原始灰度帧。
+cv::Mat IrHeatmapView(const cv::Mat & frame)
 {
-    if (!result.background.empty())
+    cv::Mat gray;
+    if (frame.channels() == 1)
     {
-        cv::Mat normalized;
-        cv::Mat bgr;
-        cv::normalize(result.background, normalized, 0, 255,
-                      cv::NORM_MINMAX, CV_8U);
-        cv::cvtColor(normalized, bgr, cv::COLOR_GRAY2BGR);
-        return bgr;
+        gray = frame;
     }
-    if (fallback.channels() == 1)
+    else
     {
-        cv::Mat bgr;
-        cv::cvtColor(fallback, bgr, cv::COLOR_GRAY2BGR);
-        return bgr;
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
     }
-    return fallback.clone();
+    cv::Mat stretched;
+    cv::normalize(gray, stretched, 0, 255, cv::NORM_MINMAX, CV_8U);
+    cv::Mat heat;
+    cv::applyColorMap(stretched, heat, cv::COLORMAP_INFERNO);
+    return heat;
 }
 
 /// 本机 OpenCV HighGUI 是 GTK 还是 Qt。Ubuntu ROS Humble 的 libopencv
@@ -1045,16 +1043,15 @@ void CoreNode::IrDetectLoop()
                     std::chrono::steady_clock::now() - infer_start).count();
             const size_t n_regions = result.regions.size();
 
-            // 2) 严格沿用参考工程的显示语义: 显示归一化的高斯背景场，
-            //    而非原始帧。检测轮廓仍来自原生分辨率，两者尺寸一致；
-            //    再统一等比适配到窗格，保证标注不会错位。
+            // 2) 同屏显示伪彩热量图(INFERNO), 不是白热原图、也不是高斯背景。
+            //    检测仍在原生灰度帧上做; 轮廓按同一套 fit 缩放到窗格。
             double fit_scale = 1.0;
             int fit_dx = 0;
             int fit_dy = 0;
             cv::Mat pane_img;
-            const cv::Mat display_source = IrBackgroundView(result, frame);
-            FitToPane(display_source, pane_width_, pane_height_, pane_img,
-                      &fit_scale, &fit_dx, &fit_dy);
+            FitToPane(
+                IrHeatmapView(frame), pane_width_, pane_height_, pane_img,
+                &fit_scale, &fit_dx, &fit_dy, cv::INTER_NEAREST);
             for (auto & region : result.regions)
             {
                 region.bbox.x = static_cast<int>(
@@ -1089,9 +1086,9 @@ void CoreNode::IrDetectLoop()
             }
 
             const std::string info =
-                cv::format("src=%.1f det=%.1f fps seepage=%zu",
+                cv::format("src=%.1f det=%.1f fps seepage=%zu %dx%d",
                            ir_.src_fps.load(std::memory_order_relaxed),
-                           fps, n_regions);
+                           fps, n_regions, frame.cols, frame.rows);
             DrawPaneHeader(pane_img, ir_.title, info);
 
             SubmitPane(pane_ir_, pane_img, last_seq);

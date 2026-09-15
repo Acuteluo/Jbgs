@@ -71,10 +71,17 @@ CTEST_RC=$?
 
 # ---- 4. 单元测试(colcon 侧 gtest) ----
 echo ""
-echo "[run_tests] 单元测试: colcon test --packages-select culvert_inspection"
+echo "[run_tests] 单元测试: culvert_inspection + culvert_core gtest"
 cd "$PROJECT_ROOT"
 colcon test --packages-select culvert_inspection > /tmp/jbgs_unit_test.log 2>&1
 UNIT_RC=$?
+# culvert_core 的 ament_lint(copyright/uncrustify 等) 与本仓库风格不一致,
+# 这里只跑 gtest, 避免把既有 linter 噪声当成功能回归。
+colcon test --packages-select culvert_core --ctest-args -L gtest >> /tmp/jbgs_unit_test.log 2>&1
+CORE_RC=$?
+if [ "$UNIT_RC" -ne 0 ] || [ "$CORE_RC" -ne 0 ]; then
+    UNIT_RC=1
+fi
 colcon test-result --verbose 2>/dev/null | tail -5 || true
 
 echo ""
