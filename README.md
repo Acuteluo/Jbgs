@@ -129,7 +129,7 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 - 同屏面板每个相机窗格信息条实时显示两个帧率：`src=` 取原相机原图帧率（帧间到达间隔 EMA，验证取图是否正常）、`det=` 模型处理完画框后的输出帧率（解释窗口刷新快慢；推理慢时 src 不变、det 下降，一眼定位瓶颈在拿图还是在模型）。
 - 面板为全屏窗口（`fullscreen`，默认开）：屏幕分辨率经 xrandr 自动探测（失败时用 `screen_width`/`screen_height` 参数兜底），并按显示器 DPI 换算 Qt 逻辑像素，保证高 DPI 屏幕也严格三等分、不裁切第三路。实现上用无边框铺满，不调用 OpenCV/GTK 独占全屏，避免 Wayland 整屏闪黑。信息互不遮挡：窗格标题与帧率在顶部信息条、传感器块在第一路其下方、导航通信块在第二路其下方、总图右下角为显示刷新率。
 - 传感器数据全部打印：T/RH/CO2 三值 + 温湿度/CO2 逐字段有效位（TH=ok/FAIL, CO2=ok/FAIL）+ 数据年龄 age；数据陈旧超过 3s 按离线显示。
-- 导航协议实时块（第二个实时窗格顶部）：标题 `NAV<->VIS PROTOCOL (level 20Hz)`；`CMD NAV->VIS` / `STS VIS->NAV` 两行各显示当前电平值与消息年龄（`x.xs ago`；**从未收到显示 `---` 和 `no msg yet`，绝不与真实的 0x00 混淆**）；状态行——`STATE: IDLE - wait nav 0x01`=空闲等指令、`STATE: CAPTURE x.xs - saving imgs`=取图中、`STATE: DONE - 0x02 till nav 0x00`=完成等导航回 0x00；颜色区分（绿=空闲/黄=取图中/橙=完成待确认）。三种异常红框加粗，文案直接点明断链侧与处置建议：`ALARM: NO NAV CMD ... - check nav!`（导航指令超阈未到）、`ALARM: NO VIS STATUS ... - check vision!`（视觉状态流中断）、`ALARM: CAPTURE ... no 0x02 after 0x01!`（开灯后超时未拍完）；阈值 `nav_cmd_fresh_sec` / `capture_done_timeout_sec` 在 launch.json 可调；字号按框宽自动收缩，长文案不溢出。
+- 导航协议实时块（第二个实时窗格顶部）：`NAV->VIS` / `VIS->NAV` 两行各显示当前电平与消息年龄（`x.xs ago`；**从未收到显示 `---` 和 `no msg yet`，绝不与真实的 0x00 混淆**）；状态词——`WAIT CMD (wait nav 0x01)`=空闲等指令、`CAPTURING x.xs`=取图中、`DONE 0x02 (wait nav 0x00)`=完成等导航回 0x00；颜色区分（绿=空闲/黄=取图中/橙=完成待确认）。三种异常红框：`ALARM NO NAV CMD x.xs > y.ys`=导航指令超阈未到、`ALARM NO VIS STATUS x.xs > y.ys`=视觉状态流中断、`ALARM CAPTURE x.xs > y.ys no 0x02`=开灯后超时未拍完；阈值 `nav_cmd_fresh_sec` / `capture_done_timeout_sec` 在 launch.json 可调。框样式/字号/行距与传感器块一致（沿用 d23d94e 布局）。
 - 离线标识：core_node 状态行 `left_hz=0(OFF)`、`env[no_data]`；驱动日志 2~5s 节流告警。
 
 ## 模拟测试

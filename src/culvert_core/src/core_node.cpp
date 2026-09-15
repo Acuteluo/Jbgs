@@ -1266,45 +1266,41 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
     const bool capture_stuck =
         capturing && cap_elapsed > capture_done_timeout_sec_;
 
-    // 状态词(in-image 只用 ASCII), 写成"自解释整句", 现场不看文档也能懂:
-    // 正常三态 = 绿"等指令" / 黄"取图中" / 橙"完成等导航回 0x00";
-    // 红色告警优先级最高, 文案直接点明"断了什么、断多久、该查哪边",
+    // 状态词(in-image 只用 ASCII), 文案点明当前阶段; 红色告警优先级最高,
     // 恢复收发后自动回到绿/黄/橙。
-    std::string state = "STATE: IDLE - wait nav 0x01";
+    std::string state = "WAIT CMD (wait nav 0x01)";
     cv::Scalar color(120, 255, 120);          // 绿
     if (cmd_lost)
     {
-        state = cv::format(
-            "ALARM: NO NAV CMD %.1fs (>%.1fs) - check nav!", cmd_age,
-            nav_cmd_fresh_sec_);
+        state = cv::format("ALARM NO NAV CMD %.1fs > %.1fs", cmd_age,
+                           nav_cmd_fresh_sec_);
         color = cv::Scalar(80, 80, 255);      // 红: 导航指令超时未到
     }
     else if (st_lost)
     {
-        state = cv::format(
-            "ALARM: NO VIS STATUS %.1fs (>%.1fs) - check vision!",
-            st_age, nav_cmd_fresh_sec_);
+        state = cv::format("ALARM NO VIS STATUS %.1fs > %.1fs", st_age,
+                           nav_cmd_fresh_sec_);
         color = cv::Scalar(80, 80, 255);      // 红: 视觉状态超时未到
     }
     else if (capture_stuck)
     {
-        state = cv::format(
-            "ALARM: CAPTURE %.1fs (>%.1fs) no 0x02 after 0x01!",
-            cap_elapsed, capture_done_timeout_sec_);
+        state = cv::format("ALARM CAPTURE %.1fs > %.1fs no 0x02",
+                           cap_elapsed, capture_done_timeout_sec_);
         color = cv::Scalar(80, 80, 255);      // 红: 0x01 后迟迟未拍完
     }
     else if (st == 0x02)
     {
-        state = "STATE: DONE - 0x02 till nav 0x00";
+        state = "DONE 0x02 (wait nav 0x00)";
         color = cv::Scalar(120, 200, 255);    // 橙: 完成, 等导航回 0x00
     }
     else if (st == 0x01 || cmd == 0x01)
     {
-        state = cv::format("STATE: CAPTURE %.1fs - saving imgs", cap_elapsed);
+        state = cv::format("CAPTURING %.1fs", cap_elapsed);
         color = cv::Scalar(60, 220, 220);     // 黄: 取图中
     }
 
-    // 唯一新增布局: 导航通信框位于第二张图上方，尺寸与传感器框一致。
+    // 布局与 d23d94e 完全一致(框位置/尺寸/底色/线宽/字号/行距都不变),
+    // 本轮只改通信提示文字(新鲜度/---/状态词)。
     constexpr int kOverlayHeight = 120;
     const int overlay_width = std::max(1, std::min(560, pane_width_ - 12));
     const int x = pane_width_ + pane_gap_ + 6;
@@ -1312,31 +1308,11 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
     cv::Mat roi = canvas(bg);
     cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
     cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
-    // 框体与文字同色: 正常细边框, 告警红框加粗, 远处一眼可见
-    const bool alarm = cmd_lost || st_lost || capture_stuck;
+    cv::rectangle(canvas, bg, color, 1, cv::LINE_AA);
 
-    // 四行: 标题(协议名) / 指令行 / 状态行 / 状态词。字号自动收缩,
-    // 保证整行落在框内 —— 小屏或窄窗格下告警文案也不能被截断。
-    const auto put_line = [&](const std::string & text, int y, double base,
-                              const cv::Scalar & c, int thick) {
-        double scale = base;
-        const int max_w = overlay_width - 16;
-        const int tw = cv::getTextSize(
-            text, cv::FONT_HERSHEY_SIMPLEX, scale, 1, nullptr).width;
-        if (tw > max_w)
-        {
-            scale *= static_cast<double>(max_w) / tw;
-        }
-        cv::putText(canvas, text, cv::Point(x + 8, y),
-                    cv::FONT_HERSHEY_SIMPLEX, scale, c, thick, cv::LINE_AA);
-    };
-
-    put_line("NAV<->VIS PROTOCOL (level 20Hz)", 78, 0.50,
-             cv::Scalar(200, 200, 200), 1);
-
-    // 每行尾部附消息年龄: 从未收到显示 "no msg yet", 否则 "x.xs ago";
-    // 字节位同理 —— 从未收到渲染 "---" 而不是初值 0x00, 杜绝"没发"被
-    // 读成"在发 0x00"。配合阈值一眼看出链路断在哪一侧、断了多久。
+    // 每行 = 方向 + 当前电平 + 消息年龄: 从未收到字节位显示 "---"、年龄
+    // 显示 "no msg yet"(而不是初值 0x00), 杜绝"导航没发"被读成"在发 0x00";
+    // 配合阈值一眼看出链路断在哪一侧、断了多久。
     const std::string cmd_age_txt = has_cmd ?
         cv::format("%.1fs ago", cmd_age) : "no msg yet";
     const std::string st_age_txt = has_st ?
@@ -1345,15 +1321,18 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
         cv::format("0x%02X", cmd) : "---";
     const std::string st_byte_txt = has_st ?
         cv::format("0x%02X", st) : "---";
-    put_line(cv::format("CMD  NAV->VIS  %s  %s", cmd_byte_txt.c_str(),
-                        cmd_age_txt.c_str()),
-             104, 0.54, color, alarm ? 2 : 1);
-    put_line(cv::format("STS  VIS->NAV  %s  %s", st_byte_txt.c_str(),
-                        st_age_txt.c_str()),
-             132, 0.54, color, alarm ? 2 : 1);
-    put_line(state, 162, 0.52, color, alarm ? 2 : 1);
-
-    cv::rectangle(canvas, bg, color, alarm ? 3 : 1, cv::LINE_AA);
+    char l_nav[80];
+    std::snprintf(l_nav, sizeof(l_nav), "NAV->VIS  %s  %s",
+                  cmd_byte_txt.c_str(), cmd_age_txt.c_str());
+    char l_vis[80];
+    std::snprintf(l_vis, sizeof(l_vis), "VIS->NAV  %s  %s",
+                  st_byte_txt.c_str(), st_age_txt.c_str());
+    cv::putText(canvas, l_nav, cv::Point(x + 10, 94),
+                cv::FONT_HERSHEY_SIMPLEX, 0.54, color, 1, cv::LINE_AA);
+    cv::putText(canvas, l_vis, cv::Point(x + 10, 128),
+                cv::FONT_HERSHEY_SIMPLEX, 0.54, color, 1, cv::LINE_AA);
+    cv::putText(canvas, state, cv::Point(x + 10, 160),
+                cv::FONT_HERSHEY_SIMPLEX, 0.50, color, 1, cv::LINE_AA);
 }
 
 // ============================== 同屏显示线程 ==============================
