@@ -2,14 +2,18 @@
 // 作用: 巡检协议状态机核心(无 ROS 依赖, 可被 gtest 直接单测)。
 //
 // 协议(std_msgs/msg/UInt8, 详见 inspection_node):
+//   双向都是"持续电平广播", 不是一问一答: 导航 20Hz 一直发指令电平,
+//   视觉 20Hz 一直发状态电平; 电平保持到新状态/新指令为止。
 //   输入 0x01 -> 记录触发时刻 t(单调钟), 左右相机以"触发时刻的到达计数"
 //                为基线, 各自独立等待"t 后按到达顺序的第 N 帧"(N 默认 2,
 //                t 时刻视为第 0 帧);
 //   目标帧解码失败 -> 顺延取其后第 N+1、N+2…帧(不计为进展);
 //   自最近一次成功捕获(或触发)起超过 frame_timeout_sec -> 放弃
-//   (不发 0x02), 持续坏帧同样会被超时兜住;
+//   (不进入完成态), 持续坏帧同样会被超时兜住;
 //   双帧齐 -> 写 <左帧时间戳>_left.jpg / <右帧时间戳>_right.jpg;
-//             全部成功 -> 恰好发一次 0x02; 任一失败 -> 不发 0x02。
+//             全部成功 -> 进入完成态(ack_, 节点据此把状态电平置为 0x02
+//             并持续广播, 直到收到导航 0x00 才回到 0x00);
+//             任一失败 -> 不进入完成态(状态电平保持 0x00)。
 //
 // 线程约定(由 inspection_node 外部保证):
 //   - onFrame 的"空闲快路径"(仅到达计数)是无锁原子的;
@@ -68,7 +72,7 @@ public:
         const uint8_t * data, size_t size)>;             ///< 帧解码校验
     using Writer = std::function<bool(
         const std::string & path, const uint8_t * data, size_t size)>;  ///< 写盘
-    using AckSender = std::function<void()>;             ///< 发布 0x02
+    using AckSender = std::function<void()>;             ///< 进入完成态(节点据此持续广播 0x02)
     using Remover = std::function<bool(const std::string & path)>;  ///< 删文件
     using Clock = std::function<std::chrono::steady_clock::time_point()>;  ///< 单调钟
     using WallNs = std::function<int64_t()>;             ///< 系统钟纳秒(文件名兜底)
@@ -260,7 +264,7 @@ private:
     /// 刷新"最近进展"时刻(超时从此起算)。
     void touchProgress() { last_progress_ = clock_(); }
 
-    /// 左右原图 + 左右标注图四者齐 -> 写盘 -> 成功发一次 0x02。
+    /// 左右原图 + 左右标注图四者齐 -> 写盘 -> 成功进入完成态(ack_)。
     /// (需外部串行化; onFrame 与 onAnnotatedFrame 都会调用本函数)
     void finishIfReady()
     {
@@ -304,11 +308,11 @@ private:
 
         if (ok)
         {
-            ack_();   // 仅此一处发布 0x02
+            ack_();   // 仅此一处进入完成态(节点侧 = 持续广播 0x02 的门控)
             log_("INFO", "[cycle " + std::to_string(cycle_id_) +
                  "] 巡检完成: 原图 " + left_path + " / " + right_path +
                  " + 标注图 " + left_ann_path + " / " + right_ann_path +
-                 " 已写入, 发布确认 0x02");
+                 " 已写入, 状态置为 0x02(持续广播至收到导航 0x00)");
             state_.store(FsmState::kIdle, std::memory_order_release);
             return;
         }
@@ -320,7 +324,7 @@ private:
         log_("ERROR", "[cycle " + std::to_string(cycle_id_) + "] 写盘失败(" +
              std::string(ok_left ? "left ok" : "left FAIL") + "/" +
              std::string(ok_right ? "right ok" : "right FAIL") +
-             "), 已清理半对文件, 不发送 0x02");
+             "), 已清理半对文件, 不进入完成态(状态保持 0x00)");
         state_.store(FsmState::kIdle, std::memory_order_release);
     }
 

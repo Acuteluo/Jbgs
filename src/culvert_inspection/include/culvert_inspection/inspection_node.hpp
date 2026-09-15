@@ -58,6 +58,8 @@ private:
     /// 看门狗(10Hz): 无进展超时检查。
     void WatchdogTimer();
     /// 协议状态定时发布(可调频率): 0x00 空闲 / 0x01 保存中 / 0x02 完成。
+    /// 电平语义: 持续广播当前状态, 不是一次性确认 —— 0x02 会一直保持到
+    /// 收到导航 0x00(周期结束) 才回到 0x00。
     void StatusTimer();
     /// 标注图回调: Armed 且原图已捕获时, 按时间戳容差配对暂存。
     void AnnotatedCallback(

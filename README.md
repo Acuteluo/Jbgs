@@ -95,13 +95,13 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 
 ## 巡检通信协议（仅本机 ROS2 topic，无串口）
 
-包 `culvert_inspection`，消息 `std_msgs/msg/UInt8`：
+包 `culvert_inspection`，消息 `std_msgs/msg/UInt8`。**双向都是持续电平广播，不是一问一答**：导航 20Hz 一直发指令电平，视觉 20Hz 一直发状态电平，电平保持到新状态/新指令为止。
 
 1. 输入话题收到 `0x01`：记录单调时刻 t，对左右相机**分别独立**等待"t 后按**到达顺序**的第 2 帧"（t 时刻视为第 0 帧；不用消息时间戳做选择，时间戳只用于文件名）。
-2. 目标帧解码失败或相机离线 → 继续等该相机的第 3、4…帧；自最近一次成功捕获（或触发）起超过 `frame_timeout_sec` → 放弃，**不发确认**（持续坏帧也会被超时兜住）。
-3. 左右均取到 → 写盘 `run_save/<该帧时间戳>_left.jpg`、`run_save/<该帧时间戳>_right.jpg`（纳秒时间戳，左右各自独立）→ **恰好发布一次 `0x02`**。
-4. 重复 `0x01`、Armed/保存中再次 `0x01`（try_lock 拦截）、超时、写盘失败：均有明确状态机行为与限流日志，绝不误发 `0x02`；写盘单侧失败会清理已写出的半对文件。
-5. 完成一轮（已发 `0x02`）后进入"等导航回 `0x00`"门控：期间残留的 `0x01` 一律忽略，**直到收到导航 `0x00` 才解除**——`0x00` 是周期结束信号，必须最先处理（曾因其被"非 0x01 即拒绝"拦截成死代码，导致第二站触发被永久忽略）。
+2. 目标帧解码失败或相机离线 → 继续等该相机的第 3、4…帧；自最近一次成功捕获（或触发）起超过 `frame_timeout_sec` → 放弃，**不进入完成态**（持续坏帧也会被超时兜住）。
+3. 左右均取到 → 写盘 `run_save/<该帧时间戳>_left.jpg`、`run_save/<该帧时间戳>_right.jpg`（纳秒时间戳，左右各自独立）→ 状态置为 `0x02` **持续广播**（每周期只进入这一次；导航收到后可通知电控关灯前进）。
+4. 重复 `0x01`、Armed/保存中再次 `0x01`（try_lock 拦截）、超时、写盘失败：均有明确状态机行为与限流日志，绝不误进完成态；写盘单侧失败会清理已写出的半对文件。
+5. 完成一轮（状态已置 `0x02`）后进入"等导航回 `0x00`"门控：`0x02` 电平持续广播，期间残留的 `0x01` 一律忽略，**直到收到导航 `0x00` 状态才回到 `0x00`**——`0x00` 是周期结束信号，必须最先处理（曾因其被"非 0x01 即拒绝"拦截成死代码，导致第二站触发被永久忽略）。
 6. 面板导航通信块带**新鲜度校验**（`nav_cmd_fresh_sec` / `capture_done_timeout_sec`，launch.json 可调，默认 2s）：电平协议下"导航没接入"与"在行车（0x00）"看到的字节相同，只有消息到达时刻能区分。超过 `nav_cmd_fresh_sec` 没收到导航指令 → 红框 `NAV CMD LOST`；收到 `0x01` 后超过 `capture_done_timeout_sec` 视觉仍未回 `0x02` → 红框 `CAPTURE STUCK`；视觉状态流超阈 → 红框 `VIS STATUS LOST`。恢复收发后自动复原。
 7. `in_trulyworking=false`：节点不订阅协议话题、不保存任何巡检图片。
 
@@ -129,7 +129,7 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 - 同屏面板每个相机窗格信息条实时显示两个帧率：`src=` 取原相机原图帧率（帧间到达间隔 EMA，验证取图是否正常）、`det=` 模型处理完画框后的输出帧率（解释窗口刷新快慢；推理慢时 src 不变、det 下降，一眼定位瓶颈在拿图还是在模型）。
 - 面板为全屏窗口（`fullscreen`，默认开）：屏幕分辨率经 xrandr 自动探测（失败时用 `screen_width`/`screen_height` 参数兜底），并按显示器 DPI 换算 Qt 逻辑像素，保证高 DPI 屏幕也严格三等分、不裁切第三路。实现上用无边框铺满，不调用 OpenCV/GTK 独占全屏，避免 Wayland 整屏闪黑。信息互不遮挡：窗格标题与帧率在顶部信息条、传感器块在第一路其下方、导航通信块在第二路其下方、总图右下角为显示刷新率。
 - 传感器数据全部打印：T/RH/CO2 三值 + 温湿度/CO2 逐字段有效位（TH=ok/FAIL, CO2=ok/FAIL）+ 数据年龄 age；数据陈旧超过 3s 按离线显示。
-- 导航协议实时块（第二个实时窗格顶部）：`NAV->VIS 0x..` / `VIS->NAV 0x..` 各附消息年龄（`x.xs ago`，从未收到显示 `no msg yet`）+ 状态词——`WAIT CMD`=等待指令、`CAPTURING x.xs`=取图中、`DONE (wait nav 0x00)`=取图完成等导航确认；颜色区分（绿=空闲/黄=取图中/橙=完成待确认）。三种异常红框加粗：`NAV CMD LOST`=导航指令超时未到、`CAPTURE STUCK`=开灯后超时未拍完、`VIS STATUS LOST`=视觉状态流中断；阈值 `nav_cmd_fresh_sec` / `capture_done_timeout_sec` 在 launch.json 可调。
+- 导航协议实时块（第二个实时窗格顶部）：标题 `NAV<->VIS PROTOCOL (level 20Hz)`；`CMD NAV->VIS` / `STS VIS->NAV` 两行各显示当前电平值与消息年龄（`x.xs ago`；**从未收到显示 `---` 和 `no msg yet`，绝不与真实的 0x00 混淆**）；状态行——`STATE: IDLE - wait nav 0x01`=空闲等指令、`STATE: CAPTURE x.xs - saving imgs`=取图中、`STATE: DONE - 0x02 till nav 0x00`=完成等导航回 0x00；颜色区分（绿=空闲/黄=取图中/橙=完成待确认）。三种异常红框加粗，文案直接点明断链侧与处置建议：`ALARM: NO NAV CMD ... - check nav!`（导航指令超阈未到）、`ALARM: NO VIS STATUS ... - check vision!`（视觉状态流中断）、`ALARM: CAPTURE ... no 0x02 after 0x01!`（开灯后超时未拍完）；阈值 `nav_cmd_fresh_sec` / `capture_done_timeout_sec` 在 launch.json 可调；字号按框宽自动收缩，长文案不溢出。
 - 离线标识：core_node 状态行 `left_hz=0(OFF)`、`env[no_data]`；驱动日志 2~5s 节流告警。
 
 ## 模拟测试
