@@ -97,8 +97,8 @@ Found 2 device(s):
 | `camera_name` | `left_camera` / `right_camera` | 话题与 camera_info 名字 |
 | `frame_id` | `left_camera_optical_frame` / ... | 图像 frame_id |
 | `camera_info_url` | 对应 yaml | 标定文件（左右各一份，先用占位值，**需分别标定后替换**） |
-| `exposure_time` | `5000` (us) | 曝光，运行时可调 |
-| `gain` | `1.0` | 增益，运行时可调 |
+| `exposure_time` | `25000` (us) | 曝光，运行时可调 |
+| `gain` | `2.0` | 增益，运行时可调 |
 | `frame_rate` | `0.0` | Hz；0=连续采集，>0 时使用软件触发精确限帧 |
 | `packet_size` | `0` | GigE 包长；主机 MTU=9000 时推荐 8192 |
 | `throughput_limit_bps` | `0` | 设备链路带宽上限（B/s）；双机 10 Hz 共用千兆链路时每台推荐 55000000 |

@@ -218,8 +218,8 @@ struct CameraContext
     int64_t throughput_limit_bps = 0;  ///< 单相机链路带宽上限(B/s); 0 = 不限制
     int64_t packet_delay = 0;     ///< 吞吐限速不受支持时使用的 GVSP 包间隔(tick)
     // 原子类型: 采集线程(时间戳修正)与参数回调线程会跨线程读写。
-    std::atomic<double> exposure_time{5000.0};  ///< 曝光时间(us)
-    double gain = 1.0;              ///< 增益
+    std::atomic<double> exposure_time{25000.0};  ///< 曝光时间(us)
+    double gain = 2.0;              ///< 增益
     double frame_rate = 0.0;        ///< 帧率(Hz), 0 = 保持默认
 
     std::shared_ptr<GalaxyDevice> device;   ///< SDK 线程安全封装(每台一个)
@@ -382,8 +382,8 @@ GalaxyCameraNode::GalaxyCameraNode(const rclcpp::NodeOptions & options)
         declare_parameter<std::string>(
             "cameras." + name + ".camera_info_url",
             "package://galaxy_camera_dual/config/camera_info.yaml");
-        declare_parameter<double>("cameras." + name + ".exposure_time", 5000.0);
-        declare_parameter<double>("cameras." + name + ".gain", 1.0);
+        declare_parameter<double>("cameras." + name + ".exposure_time", 25000.0);
+        declare_parameter<double>("cameras." + name + ".gain", 2.0);
         declare_parameter<double>("cameras." + name + ".frame_rate", 0.0);
         declare_parameter<int>("cameras." + name + ".packet_size", 0);
         declare_parameter<int>(
