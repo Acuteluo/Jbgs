@@ -249,19 +249,24 @@ InspectionNode::InspectionNode()
 
 void InspectionNode::CommandCallback(const std_msgs::msg::UInt8::SharedPtr msg)
 {
+    last_cmd_level_.store(msg->data, std::memory_order_relaxed);
+
+    // 0x00 必须先于"非 0x01 即拒绝"判断处理: 它是导航发来的周期结束信号,
+    // 负责解除完成门控。曾经把它放在 !=0x01 的拒绝分支之后, 成为死代码,
+    // 导致门控永不复位 —— 第一站成功后所有后续 0x01 都被当成"残留指令"
+    // 忽略(实车第二次开灯后视觉不再取图的根因)。
+    if (msg->data == 0x00)
+    {
+        // 导航回 0x00 = 上一站流程结束, 解除门控(之后的 0x01 才是新周期)
+        done_await_zero_ = false;
+        return;
+    }
     if (msg->data != 0x01)
     {
         RCLCPP_WARN_THROTTLE(
             get_logger(), *this, 5000,
-            "收到未知巡检指令 0x%02X(仅支持 0x01), 忽略", msg->data);
+            "收到未知巡检指令 0x%02X(仅支持 0x00/0x01), 忽略", msg->data);
         return;
-    }
-
-    last_cmd_level_.store(msg->data, std::memory_order_relaxed);
-    // 导航回 0x00 = 上一站流程结束, 解除门控(之后的 0x01 才是新周期)
-    if (msg->data == 0x00)
-    {
-        done_await_zero_ = false;
     }
     // 完成后残留的 0x01(导航尚未切回 0x00)必须忽略, 防止误触发下一站
     if (done_await_zero_)

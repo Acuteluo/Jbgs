@@ -557,6 +557,11 @@ void CoreNode::InitParams()
         "vision_cmd_topic", "/vision_capture_cmd");
     vision_status_topic_ = declare_parameter(
         "vision_status_topic", "/vision_capture_status");
+    // 导航协议新鲜度阈值(面板红色告警; launch.json 的 nav_cmd_fresh_sec /
+    // capture_done_timeout_sec 经 launch 参数覆盖, 缺省 2s)
+    nav_cmd_fresh_sec_ = declare_parameter("nav_cmd_fresh_sec", 2.0);
+    capture_done_timeout_sec_ =
+        declare_parameter("capture_done_timeout_sec", 2.0);
     ir_params_.enable_clahe = declare_parameter("ir.enable_clahe", false);
     ir_params_.clahe_clip = declare_parameter("ir.clahe_clip", 2.0);
 }
@@ -584,19 +589,45 @@ void CoreNode::InitROS2()
                 "/core_node/right_annotated", ann_qos);
     }
 
-    // 导航协议可视化订阅(独立展示, 不影响巡检节点)
+    // 导航协议可视化订阅(独立展示, 不影响巡检节点)。
+    // 同时记录每条消息的到达时刻与取图周期起点, 供面板做新鲜度校验:
+    // 电平协议下"没收到消息"与"收到 0x00"在面板上无法区分, 必须靠到达
+    // 时刻判断导航/视觉链路是否活着。
     const auto nav_qos = rclcpp::QoS(
         rclcpp::QoSInitialization::from_rmw(rmw_qos_profile_sensor_data),
         rmw_qos_profile_sensor_data);
     nav_cmd_sub_ = create_subscription<std_msgs::msg::UInt8>(
         vision_cmd_topic_, nav_qos,
         [this](std_msgs::msg::UInt8::SharedPtr m) {
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(nav_mutex_);
             nav_cmd_.store(m->data, std::memory_order_relaxed);
+            nav_cmd_recv_ = now;
+            has_nav_cmd_ = true;
+            // 取图周期: 该周期首个 0x01 起算(20Hz 重复 0x01 不重置起点),
+            // 导航回 0x00 或视觉回 0x02 时结束
+            if (m->data == 0x01 && !capturing_)
+            {
+                capturing_ = true;
+                capture_since_ = now;
+            }
+            else if (m->data == 0x00)
+            {
+                capturing_ = false;
+            }
         });
     nav_status_sub_ = create_subscription<std_msgs::msg::UInt8>(
         vision_status_topic_, nav_qos,
         [this](std_msgs::msg::UInt8::SharedPtr m) {
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(nav_mutex_);
             nav_status_.store(m->data, std::memory_order_relaxed);
+            nav_status_recv_ = now;
+            has_nav_status_ = true;
+            if (m->data == 0x02)
+            {
+                capturing_ = false;   // 视觉已确认拍完, 取图周期结束
+            }
         });
 
     left_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -1199,22 +1230,67 @@ void CoreNode::DrawSensorOverlay(cv::Mat & canvas)
 
 void CoreNode::DrawNavOverlay(cv::Mat & canvas)
 {
-    // 取协议快照(原子读)
-    const uint8_t cmd = nav_cmd_.load(std::memory_order_relaxed);
-    const uint8_t st = nav_status_.load(std::memory_order_relaxed);
+    // 协议快照 + 到达时刻(锁内一次性取, 避免与两个话题回调竞争)
+    uint8_t cmd = 0;
+    uint8_t st = 0;
+    double cmd_age = 1e9;
+    double st_age = 1e9;
+    bool capturing = false;
+    double cap_elapsed = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(nav_mutex_);
+        cmd = nav_cmd_.load(std::memory_order_relaxed);
+        st = nav_status_.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        cmd_age = has_nav_cmd_ ?
+            std::chrono::duration<double>(now - nav_cmd_recv_).count() : 1e9;
+        st_age = has_nav_status_ ?
+            std::chrono::duration<double>(now - nav_status_recv_).count() : 1e9;
+        capturing = capturing_;
+        cap_elapsed = capturing_ ?
+            std::chrono::duration<double>(now - capture_since_).count() : 0.0;
+    }
+
+    // 新鲜度判定(电平协议的关键补丁): 行车时导航发的恰好是 0x00, 导航没
+    // 接入时面板看到的也是 0x00 —— 电平值本身无法区分"在行车"与"链路断",
+    // 必须用消息到达时刻做校验。任一向超阈即红框, 一眼定位是哪条链路断。
+    const bool cmd_lost = cmd_age > nav_cmd_fresh_sec_;
+    const bool st_lost = st_age > nav_cmd_fresh_sec_;
+    // 开灯取图时限: 该周期首个 0x01 起算, 超时仍未见视觉回 0x02 -> 红。
+    const bool capture_stuck =
+        capturing && cap_elapsed > capture_done_timeout_sec_;
 
     // 状态词(in-image 只用 ASCII): WAIT=等待指令, CAP=取图中,
-    // DONE=取图完成, ACK?=等待导航确认(0x02 已发、导航未回 0x00)
-    const char * state = "WAIT CMD";
+    // DONE=取图完成, ACK?=等待导航确认(0x02 已发、导航未回 0x00);
+    // 红色告警优先级最高, 恢复收发后自动回到绿/黄/橙。
+    std::string state = "WAIT CMD";
     cv::Scalar color(120, 255, 120);          // 绿
-    if (st == 0x02)
+    if (cmd_lost)
+    {
+        state = cv::format("NAV CMD LOST %.1fs > %.1fs", cmd_age,
+                           nav_cmd_fresh_sec_);
+        color = cv::Scalar(80, 80, 255);      // 红: 导航指令超时未到
+    }
+    else if (st_lost)
+    {
+        state = cv::format("VIS STATUS LOST %.1fs > %.1fs", st_age,
+                           nav_cmd_fresh_sec_);
+        color = cv::Scalar(80, 80, 255);      // 红: 视觉状态超时未到
+    }
+    else if (capture_stuck)
+    {
+        state = cv::format("CAPTURE STUCK %.1fs > %.1fs", cap_elapsed,
+                           capture_done_timeout_sec_);
+        color = cv::Scalar(80, 80, 255);      // 红: 0x01 后迟迟未拍完
+    }
+    else if (st == 0x02)
     {
         state = "DONE (wait nav 0x00)";
         color = cv::Scalar(120, 200, 255);    // 橙: 等待导航确认
     }
     else if (st == 0x01 || cmd == 0x01)
     {
-        state = "CAPTURING";
+        state = cv::format("CAPTURING %.1fs", cap_elapsed);
         color = cv::Scalar(60, 220, 220);     // 黄: 取图中
     }
 
@@ -1226,12 +1302,20 @@ void CoreNode::DrawNavOverlay(cv::Mat & canvas)
     cv::Mat roi = canvas(bg);
     cv::Mat dark(roi.size(), roi.type(), cv::Scalar(20, 20, 20));
     cv::addWeighted(dark, 0.55, roi, 0.45, 0.0, roi);
-    cv::rectangle(canvas, bg, color, 1, cv::LINE_AA);
+    // 框体与文字同色: 正常细边框, 告警红框加粗, 远处一眼可见
+    const bool alarm = cmd_lost || st_lost || capture_stuck;
+    cv::rectangle(canvas, bg, color, alarm ? 3 : 1, cv::LINE_AA);
 
-    char l_nav[64];
-    std::snprintf(l_nav, sizeof(l_nav), "NAV->VIS  0x%02X", cmd);
-    char l_vis[64];
-    std::snprintf(l_vis, sizeof(l_vis), "VIS->NAV  0x%02X", st);
+    // 每行尾部附消息年龄: 从未收到显示 "no msg yet", 否则 "x.xs ago",
+    // 配合阈值一眼看出链路断在哪一侧、断了多久。
+    const std::string cmd_age_txt = (cmd_age > 1e8) ?
+        "no msg yet" : cv::format("%.1fs ago", cmd_age);
+    const std::string st_age_txt = (st_age > 1e8) ?
+        "no msg yet" : cv::format("%.1fs ago", st_age);
+    const std::string l_nav =
+        cv::format("NAV->VIS  0x%02X  %s", cmd, cmd_age_txt.c_str());
+    const std::string l_vis =
+        cv::format("VIS->NAV  0x%02X  %s", st, st_age_txt.c_str());
     cv::putText(canvas, l_nav, cv::Point(x + 10, 94),
                 cv::FONT_HERSHEY_SIMPLEX, 0.54, color, 1, cv::LINE_AA);
     cv::putText(canvas, l_vis, cv::Point(x + 10, 128),

@@ -213,6 +213,20 @@ private:
     rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr nav_cmd_sub_;
     rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr nav_status_sub_;
 
+    // 导航协议新鲜度(面板红色告警; 双话题回调与显示线程并发, 互斥保护)。
+    // 电平协议本身不带"是否在线"信息: 导航不发指令时面板看到的仍是上次
+    // 电平(恰好行车时是 0x00), 无法区分"在行车"与"导航没接入", 故用
+    // 到达时刻做新鲜度校验 —— 超阈即红框告警, 恢复后自动复原。
+    std::mutex nav_mutex_;                     ///< 保护以下到达时刻/取图周期
+    std::chrono::steady_clock::time_point nav_cmd_recv_;    ///< 最近收到导航指令
+    bool has_nav_cmd_ = false;                 ///< 是否收到过导航指令
+    std::chrono::steady_clock::time_point nav_status_recv_; ///< 最近收到视觉状态
+    bool has_nav_status_ = false;              ///< 是否收到过视觉状态
+    std::chrono::steady_clock::time_point capture_since_;   ///< 本周期首次 0x01 时刻
+    bool capturing_ = false;                   ///< 取图周期进行中(0x01 起 0x00/0x02 止)
+    double nav_cmd_fresh_sec_ = 2.0;           ///< 指令新鲜度阈值(超则红框, json 可调)
+    double capture_done_timeout_sec_ = 2.0;    ///< 0x01 后取图完成时限(超则红框, json 可调)
+
     // ---- 标注图发布(巡检保存"模型处理完框出来的图"用) ----
     bool publish_annotated_ = true;   ///< 是否发布标注图话题
     int annotated_quality_ = 85;      ///< 标注图 JPEG 质量

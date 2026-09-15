@@ -291,6 +291,12 @@ def core_node(args, log_level=''):
     if isinstance(cfg.get('fullscreen'), bool):
         # 全屏展示: 窗口无边框占满整屏, 窗格高度按屏幕宽高比自动计算
         overrides['fullscreen'] = cfg['fullscreen']
+    # 导航协议新鲜度阈值(面板红色告警; 详见 launch.json 键说明)
+    if cfg.get('nav_cmd_fresh_sec') is not None:
+        overrides['nav_cmd_fresh_sec'] = float(cfg['nav_cmd_fresh_sec'])
+    if cfg.get('capture_done_timeout_sec') is not None:
+        overrides['capture_done_timeout_sec'] = float(
+            cfg['capture_done_timeout_sec'])
 
     return Node(
         package='culvert_core',

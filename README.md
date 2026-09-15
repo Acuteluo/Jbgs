@@ -101,7 +101,9 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 2. 目标帧解码失败或相机离线 → 继续等该相机的第 3、4…帧；自最近一次成功捕获（或触发）起超过 `frame_timeout_sec` → 放弃，**不发确认**（持续坏帧也会被超时兜住）。
 3. 左右均取到 → 写盘 `run_save/<该帧时间戳>_left.jpg`、`run_save/<该帧时间戳>_right.jpg`（纳秒时间戳，左右各自独立）→ **恰好发布一次 `0x02`**。
 4. 重复 `0x01`、Armed/保存中再次 `0x01`（try_lock 拦截）、超时、写盘失败：均有明确状态机行为与限流日志，绝不误发 `0x02`；写盘单侧失败会清理已写出的半对文件。
-5. `in_trulyworking=false`：节点不订阅协议话题、不保存任何巡检图片。
+5. 完成一轮（已发 `0x02`）后进入"等导航回 `0x00`"门控：期间残留的 `0x01` 一律忽略，**直到收到导航 `0x00` 才解除**——`0x00` 是周期结束信号，必须最先处理（曾因其被"非 0x01 即拒绝"拦截成死代码，导致第二站触发被永久忽略）。
+6. 面板导航通信块带**新鲜度校验**（`nav_cmd_fresh_sec` / `capture_done_timeout_sec`，launch.json 可调，默认 2s）：电平协议下"导航没接入"与"在行车（0x00）"看到的字节相同，只有消息到达时刻能区分。超过 `nav_cmd_fresh_sec` 没收到导航指令 → 红框 `NAV CMD LOST`；收到 `0x01` 后超过 `capture_done_timeout_sec` 视觉仍未回 `0x02` → 红框 `CAPTURE STUCK`；视觉状态流超阈 → 红框 `VIS STATUS LOST`。恢复收发后自动复原。
+7. `in_trulyworking=false`：节点不订阅协议话题、不保存任何巡检图片。
 
 状态机核心在 `src/culvert_inspection/include/culvert_inspection/inspection_fsm.hpp`（无 ROS 依赖，gtest 单测覆盖）；rclcpp 薄封装在 `src/inspection_node.cpp`。
 
@@ -127,7 +129,7 @@ launch 参数优先级高于 launch.json。**全部可调 launch 键**（空值 
 - 同屏面板每个相机窗格信息条实时显示两个帧率：`src=` 取原相机原图帧率（帧间到达间隔 EMA，验证取图是否正常）、`det=` 模型处理完画框后的输出帧率（解释窗口刷新快慢；推理慢时 src 不变、det 下降，一眼定位瓶颈在拿图还是在模型）。
 - 面板为全屏窗口（`fullscreen`，默认开）：屏幕分辨率经 xrandr 自动探测（失败时用 `screen_width`/`screen_height` 参数兜底），并按显示器 DPI 换算 Qt 逻辑像素，保证高 DPI 屏幕也严格三等分、不裁切第三路。实现上用无边框铺满，不调用 OpenCV/GTK 独占全屏，避免 Wayland 整屏闪黑。信息互不遮挡：窗格标题与帧率在顶部信息条、传感器块在第一路其下方、导航通信块在第二路其下方、总图右下角为显示刷新率。
 - 传感器数据全部打印：T/RH/CO2 三值 + 温湿度/CO2 逐字段有效位（TH=ok/FAIL, CO2=ok/FAIL）+ 数据年龄 age；数据陈旧超过 3s 按离线显示。
-- 导航协议实时块（第二个实时窗格顶部）：`NAV->VIS 0x.. VIS->NAV 0x..` + 状态词——`WAIT CMD`=等待指令、`CAPTURING`=取图中、`DONE (wait nav 0x00)`=取图完成等导航确认；颜色区分（绿=空闲/黄=取图中/橙=完成待确认）。
+- 导航协议实时块（第二个实时窗格顶部）：`NAV->VIS 0x..` / `VIS->NAV 0x..` 各附消息年龄（`x.xs ago`，从未收到显示 `no msg yet`）+ 状态词——`WAIT CMD`=等待指令、`CAPTURING x.xs`=取图中、`DONE (wait nav 0x00)`=取图完成等导航确认；颜色区分（绿=空闲/黄=取图中/橙=完成待确认）。三种异常红框加粗：`NAV CMD LOST`=导航指令超时未到、`CAPTURE STUCK`=开灯后超时未拍完、`VIS STATUS LOST`=视觉状态流中断；阈值 `nav_cmd_fresh_sec` / `capture_done_timeout_sec` 在 launch.json 可调。
 - 离线标识：core_node 状态行 `left_hz=0(OFF)`、`env[no_data]`；驱动日志 2~5s 节流告警。
 
 ## 模拟测试
@@ -148,7 +150,7 @@ colcon test --packages-select tas_sensor_driver --ctest-args -R '^test_modbus_pr
 | `02_full_sim` | 全模拟启动，全部话题可观测，关停无残留 |
 | `03_missing_{left,right,ir,sensor}` | 初始缺任一设备，其余持续工作 + 离线标注 |
 | `04_hotplug` | 四设备错峰断连/恢复、其他设备不受扰、OFF 标注、节流日志 |
-| `05_protocol` | 严格选 t 后第 2 帧（含文件内容校验）、重复 0x01、解码失败顺延、单侧离线超时、写盘失败、恢复后独立巡检 |
+| `05_protocol` | 严格选 t 后第 2 帧（含文件内容校验）、重复 0x01、解码失败顺延、单侧离线超时、写盘失败、恢复后独立巡检、**0x00 门控复位后第二站正常（实车事故回归）** |
 | `07_off_mode` | in_trulyworking=false 不处理不保存 |
 
 单测（gtest，`colcon test`，12 例）另覆盖：触发时刻=第 0 帧、可配置目标帧序号、持续坏帧仍超时（解码失败不计进展）、外部计数路径不重复计数、进展与超时边界、半对文件清理等。
@@ -190,7 +192,7 @@ Culvert-Visual-Inspection-main/   红外参考工程(有 COLCON_IGNORE, 不参�
   - ✓ 配置向导：识别 USB3 坞与板载直插两种路径、忽略无载波坞网口残留地址、正确接受 169.254 link-local 地址并保留 mid360 `192.168.1.50`
   - ✓ 取流：旧版手写 `GXDQBuf`/`GXQBuf` 声明错误会导致「恰好 5 张残帧然后断流」，已按官方签名修正
   - ○ 传感器：本次验证未接入；向导会按 `/dev/ttyUSB*`/`ttyACM*` 检测，未确认时不会误置真机模式
-  - ⚠ YOLO：本机 OpenCV 4.5.4 无法加载当前 onnx，左右视觉降级透传
+  - ✓ YOLO：`models/crack_*_best.onnx` 已经 `scripts/make_opencv_onnx.py` 等价改图，OpenCV 4.5.4 DNN 可加载；换新权重后需再跑该脚本
   - 注意：双 5MP 满帧约 20fps×2 超千兆，不要把 JSON 帧率抬到向导测稳值以上
 - **conda/venv**：禁止在虚拟环境里 `colcon` / `./run.sh` / 测试；`env.sh` 会自动 deactivate
 - 巡检"t 后第 2 帧"以巡检节点**到达顺序**为准；DDS 传输有毫秒级延迟，测试用静默间隔消除边界歧义。

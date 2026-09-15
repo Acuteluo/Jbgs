@@ -13,7 +13,8 @@
 2. **巡检协议**（`culvert_inspection`，导航↔视觉：下行 `/vision_capture_cmd`、上行 `/vision_capture_status`，UInt8 电平 20Hz；完成后门控等 0x00）状态机逻辑只改 `inspection_fsm.hpp`，改完必须跑：
    - `colcon test --packages-select culvert_inspection`（gtest 单测，13 个用例）
    - `bash tests/run_tests.sh 05`（端到端）
-   - 不变量：双帧齐才写盘；写盘全成才发一次 0x02；单侧失败清理半对文件；处理中 0x01 被忽略。
+   - 不变量：双帧齐才写盘；写盘全成才发一次 0x02；单侧失败清理半对文件；处理中 0x01 被忽略；**0x00 必须先于"非 0x01 拒绝"处理**（解除完成门控，放后面就是死代码，第二站触发会被永久忽略——实车出过事故，case E 回归）。
+   - 新鲜度校验在 core_node 面板（`nav_cmd_fresh_sec` / `capture_done_timeout_sec`，launch.json 可调）：电平为 0x00 区分不出"在行车"与"导航没接入"，必须看消息到达时刻。
 3. **测试全部在 `tests/`**（C++ + ctest）与包内 gtest；不新增 pytest 除非团队一致同意；不依赖真机与外部数据集。
 4. **模拟语义**：sim 设备与真机走同一套"超时判定 → 重连"路径；改驱动热插拔逻辑时保证模拟分支不旁路。
 5. `models/`、`pictures/` 是实拍资源，**不得删除或移动**。

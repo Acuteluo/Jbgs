@@ -8,6 +8,9 @@
 //           独立巡检正常。
 //   case D: 保存目录只读 -> 写盘失败不发 0x02 且半对文件被清理; 恢复
 //           可写后下一巡检正常。
+//   case E: 实车事故回归 —— 第一站成功 -> 导航回 0x00 -> 第二站 0x01
+//           必须触发第二次完整巡检(恰第二个 0x02)。0x00 若不解除完成
+//           门控, 第二个 0x01 会被当作"残留指令"忽略, 车停在开灯处。
 // 每个用例独立保存目录; 全部通过后关停节点进程并检查无残留。
 
 #include "harness.hpp"
@@ -450,6 +453,75 @@ int main()
         rig.send_release();
         rig.stop();
         std::cout << "case D (写盘失败+恢复) PASS" << std::endl;
+    }
+
+    // ===== case E: 成功 -> 导航回 0x00 -> 第二站 0x01 触发第二次巡检 =====
+    {
+        Rig rig;
+        rig.start("proto_e", 2.0);
+        rig.wait_ready();
+
+        // 第一站: 完整成功一次
+        rig.trigger_in_quiet();
+        int64_t s2 = 0;
+        for (int k = 1; k <= 3; ++k)
+        {
+            const int64_t s = rig.next_stamp();
+            if (k == 2) { s2 = s; }
+            rig.publish_pair_full(s);
+            rig.spin(0.15);
+        }
+        auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline &&
+               rig.ack02() < 1)
+        {
+            rclcpp::spin_some(rig.driver);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECKM(rig.ack02() == 1, "第一站未发 0x02");
+
+        // 导航收到 0x02 后行车, 回 0x00 结束本周期; 随后第二站停车开灯
+        rig.send_release();
+        rig.spin(0.3);
+        rig.trigger_in_quiet();
+        int64_t t2 = 0;
+        for (int k = 1; k <= 3; ++k)
+        {
+            const int64_t s = rig.next_stamp();
+            if (k == 2) { t2 = s; }
+            rig.publish_pair_full(s);
+            rig.spin(0.15);
+        }
+        deadline = std::chrono::steady_clock::now() +
+            std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline &&
+               rig.ack02() < 2)
+        {
+            rclcpp::spin_some(rig.driver);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        // 0x00 解除了完成门控: 第二个 0x01 必须触发第二次巡检
+        CHECKM(rig.ack02() == 2,
+               "第二站 0x01 未触发第二次巡检(0x00 门控未解除): " +
+               std::to_string(rig.ack02()));
+        CHECKM(fs::exists(rig.save_dir / "raw" /
+                       (std::to_string(t2) + "_left.jpg")) &&
+                   fs::exists(rig.save_dir / "raw" /
+                              (std::to_string(t2) + "_right.jpg")),
+               "第二站巡检文件不齐");
+        // 两站共 8 个文件(各 2 原图 + 2 标注图)
+        size_t n_files = 0;
+        for (const auto & e :
+             fs::recursive_directory_iterator(rig.save_dir))
+        {
+            if (e.is_regular_file()) { ++n_files; }
+        }
+        CHECKM(n_files == 8, "两站文件总数错误: " + std::to_string(n_files));
+        (void)s2;
+        rig.send_release();
+        rig.stop();
+        std::cout << "case E (0x00 门控复位后第二站正常) PASS" << std::endl;
     }
 
     rclcpp::shutdown();
