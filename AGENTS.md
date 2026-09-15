@@ -19,7 +19,7 @@
 4. **模拟语义**：sim 设备与真机走同一套"超时判定 → 重连"路径；改驱动热插拔逻辑时保证模拟分支不旁路。
 5. `models/`、`pictures/` 是实拍资源，**不得删除或移动**。
 6. `Culvert-Visual-Inspection-main/` 是红外参考工程（有 COLCON_IGNORE），不能参与构建；红外算法已实现于 `culvert_core/ir_seepage_detector.*`。
-7. 根目录只保留 `AGENTS.md`、`README.md`、`run.sh` 三个文件，其余入目录。
+7. 根目录只保留 `AGENTS.md`、`README.md`、`run.sh`、`easy_setting.md` 四个文件，其余入目录。
 8. 中文注释：包/文件头写明职责；关键键位、开关、状态机分支必须有注释；异常路径要有详细报错。
 
 ## 测试
